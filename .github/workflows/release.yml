@@ -49,15 +49,15 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-bundle@0.12.0
-      # Two --target flags make cargo-bundle lipo them into a universal app.
+      # Two --target flags make cargo-bundle lipo them into a universal app,
+      # under target/universal/. (cargo-bundle has no --locked flag.)
       - name: Bundle
-        run: cargo bundle --release --locked --target aarch64-apple-darwin --target x86_64-apple-darwin
+        run: cargo bundle --release --format osx --target aarch64-apple-darwin --target x86_64-apple-darwin
       # Not signed with a Developer ID or notarized: ad-hoc signing at least
       # lets Apple Silicon run it once the quarantine flag is cleared.
       - name: Ad-hoc sign and package
         run: |
-          app=$(find target -path '*/bundle/osx/FEC Viewer.app' -maxdepth 6 | head -1)
-          echo "app: $app"
+          app="target/universal/release/bundle/osx/FEC Viewer.app"
           lipo -info "$app/Contents/MacOS/fec-viewer"
           codesign --force --deep --sign - "$app"
           mkdir dmg && cp -R "$app" dmg/ && ln -s /Applications dmg/Applications
