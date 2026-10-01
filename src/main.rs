@@ -1,4 +1,5 @@
 mod index;
+mod tabs;
 mod view;
 
 use std::path::PathBuf;
@@ -8,7 +9,7 @@ use gpui_kit::*;
 
 use crate::view::FilingView;
 
-actions!(fec_viewer, [Open, CloseWindow, Quit]);
+actions!(fec_viewer, [Open, CloseWindow, Minimize, Zoom, Quit]);
 
 /// Windows we've opened, so "Open…" can reuse an empty one.
 #[derive(Default)]
@@ -32,23 +33,47 @@ pub fn open_filing_window(path: Option<PathBuf>, cx: &mut App) {
         }
     }
 
+    // New filings open as a tab of the frontmost filing window.
+    let host = {
+        let ours = cx.default_global::<OpenWindows>().0.clone();
+        cx.window_stack()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|h| ours.iter().any(|(o, v)| o == h && v.upgrade().is_some()))
+    };
+
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(1280.), px(800.)), cx)),
         titlebar: Some(TitlebarOptions {
             title: Some("FEC Viewer".into()),
             ..Default::default()
         }),
+        tabbing_identifier: Some(tabs::TABBING_IDENTIFIER.into()),
         ..Default::default()
     };
     match gpui_kit::open_window(options, cx, |window, cx| {
         cx.new(|cx| FilingView::new(path, window, cx))
     }) {
-        Ok((handle, view)) => cx
-            .default_global::<OpenWindows>()
-            .0
-            .push((handle, view.downgrade())),
+        Ok((handle, view)) => {
+            cx.default_global::<OpenWindows>()
+                .0
+                .push((handle, view.downgrade()));
+            if let Some(host) = host {
+                tabs::join_tab_group(handle, host, cx);
+            }
+        }
         Err(e) => eprintln!("failed to open window: {e:#}"),
     }
+}
+
+/// Run `f` on the active window. Deferred because actions dispatch while that
+/// window is mid-update, and a window can't be updated from inside itself.
+fn with_active_window(cx: &mut App, f: impl FnOnce(&mut Window) + 'static) {
+    cx.defer(|cx| {
+        if let Some(window) = cx.active_window() {
+            let _ = window.update(cx, |_, window, _| f(window));
+        }
+    });
 }
 
 /// Finder / LaunchServices hand us `file://` URLs.
@@ -87,13 +112,13 @@ fn main() {
             KeyBinding::new("secondary-o", Open, None),
             KeyBinding::new("secondary-w", CloseWindow, None),
             KeyBinding::new("secondary-q", Quit, None),
+            KeyBinding::new("secondary-m", Minimize, None),
         ]);
+        tabs::init(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.on_action(|_: &CloseWindow, cx| {
-            if let Some(window) = cx.active_window() {
-                let _ = window.update(cx, |_, window, _| window.remove_window());
-            }
-        });
+        cx.on_action(|_: &CloseWindow, cx| with_active_window(cx, |window| window.remove_window()));
+        cx.on_action(|_: &Minimize, cx| with_active_window(cx, |window| window.minimize_window()));
+        cx.on_action(|_: &Zoom, cx| with_active_window(cx, |window| window.zoom_window()));
         cx.on_action(|_: &Open, cx| {
             let rx = cx.prompt_for_paths(PathPromptOptions {
                 files: true,
@@ -124,6 +149,16 @@ fn main() {
                     MenuItem::action("Open…", Open),
                     MenuItem::separator(),
                     MenuItem::action("Close Window", CloseWindow),
+                ],
+                disabled: false,
+            },
+            // Named "Window" so AppKit adopts it as the windows menu and adds
+            // its tab items (next/previous tab, move to new window, merge all).
+            Menu {
+                name: "Window".into(),
+                items: vec![
+                    MenuItem::action("Minimize", Minimize),
+                    MenuItem::action("Zoom", Zoom),
                 ],
                 disabled: false,
             },
