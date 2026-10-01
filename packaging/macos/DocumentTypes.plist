@@ -1,16 +1,5 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleName</key><string>FEC Viewer</string>
-  <key>CFBundleDisplayName</key><string>FEC Viewer</string>
-  <key>CFBundleIdentifier</key><string>dev.libfec.fec-viewer</string>
-  <key>CFBundleExecutable</key><string>fec-viewer</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.0.1</string>
-  <key>CFBundleVersion</key><string>1</string>
-  <key>LSMinimumSystemVersion</key><string>11.0</string>
-  <key>NSHighResolutionCapable</key><true/>
+  <!-- Appended to the Info.plist that cargo-bundle generates. Don't repeat
+       keys it already writes (identifier, version, NSHighResolutionCapable…). -->
 
   <!-- Declare the .fec type so Finder knows what it is... -->
   <key>UTExportedTypeDeclarations</key>
@@ -37,5 +26,3 @@
       <key>LSItemContentTypes</key><array><string>gov.fec.filing</string></array>
     </dict>
   </array>
-</dict>
-</plist>

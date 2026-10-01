@@ -1,0 +1,61 @@
+name: Pages
+
+# The website: a landing page at / and the browser (wasm) build of the app at
+# /demo/.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      # gpui's web backend uses unstable features.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-bindgen-cli (matching Cargo.lock)
+        run: |
+          version=$(cargo metadata --format-version 1 | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')
+          echo "wasm-bindgen $version"
+          echo "WASM_BINDGEN_VERSION=$version" >> "$GITHUB_ENV"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN_VERSION }}
+      - name: Build demo
+        run: make -C web build PROFILE=release
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp -R site/. _site/
+          cp -R web/dist _site/demo
+          ls -lR _site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

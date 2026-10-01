@@ -1,0 +1,100 @@
+name: Release
+
+# Builds release binaries and attaches them to a GitHub release. Releases are
+# created by hand (`gh release create vX.Y.Z`); this only uploads assets.
+# Running it manually builds the same files as workflow artifacts, without
+# touching any release.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: Read version (and check it matches the tag)
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = release ] && [ "${{ github.ref_name }}" != "v$version" ]; then
+            echo "::error::Tag ${{ github.ref_name }} doesn't match Cargo.toml version $version (expected v$version)"
+            exit 1
+          fi
+
+  macos:
+    needs: version
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      DMG: FEC-Viewer-${{ needs.version.outputs.version }}-macos-universal.dmg
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - name: Ensure Metal toolchain
+        run: xcrun -sdk macosx metal --version >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-bundle@0.12.0
+      # Two --target flags make cargo-bundle lipo them into a universal app.
+      - name: Bundle
+        run: cargo bundle --release --locked --target aarch64-apple-darwin --target x86_64-apple-darwin
+      # Not signed with a Developer ID or notarized: ad-hoc signing at least
+      # lets Apple Silicon run it once the quarantine flag is cleared.
+      - name: Ad-hoc sign and package
+        run: |
+          app=$(find target -path '*/bundle/osx/FEC Viewer.app' -maxdepth 6 | head -1)
+          echo "app: $app"
+          lipo -info "$app/Contents/MacOS/fec-viewer"
+          codesign --force --deep --sign - "$app"
+          mkdir dmg && cp -R "$app" dmg/ && ln -s /Applications dmg/Applications
+          hdiutil create -volname "FEC Viewer" -srcfolder dmg -ov -format UDZO "$DMG"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: ${{ env.DMG }}
+          if-no-files-found: error
+      - name: Upload to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.ref_name }}" "$DMG" --clobber
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      ZIP: fec-viewer-${{ needs.version.outputs.version }}-windows-x86_64.zip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path target/release/fec-viewer.exe -DestinationPath $env:ZIP
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: ${{ env.ZIP }}
+          if-no-files-found: error
+      - name: Upload to release
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.ref_name }}" "$ZIP" --clobber

@@ -640,7 +640,9 @@ mod tests {
             "H4|C00000001|alloc",
             "TEXT|C00000001|memo",
         ];
-        let body: String = rows.map(|r| r.replace('|', &FS.to_string()) + "\n").concat();
+        let body: String = rows
+            .map(|r| r.replace('|', &FS.to_string()) + "\n")
+            .concat();
         tempfile_path::TempPath::with_contents(&body)
     }
 

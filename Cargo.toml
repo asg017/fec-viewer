@@ -1,6 +1,6 @@
 [package]
 name = "fec-viewer"
-version = "0.0.1"
+version = "0.0.1-alpha.1"
 edition = "2024"
 publish = false
 
@@ -39,6 +39,15 @@ web-sys = { version = "0.3", features = [
     "UrlSearchParams",
     "Window",
 ] }
+
+# macOS app bundle: `cargo bundle --release` (cargo-bundle 0.12+).
+[package.metadata.bundle]
+name = "FEC Viewer"
+identifier = "dev.libfec.fec-viewer"
+
+[package.metadata.bundle.osx]
+minimum_system_version = "11.0"
+info_plist_exts = ["packaging/macos/DocumentTypes.plist"]
 
 [profile.release]
 lto = "thin"
