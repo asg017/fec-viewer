@@ -1,13 +1,17 @@
 mod filing;
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 mod tabs;
 mod view;
+#[cfg(target_family = "wasm")]
+mod web;
 
 use std::path::PathBuf;
 
+#[cfg(not(target_family = "wasm"))]
 use futures::StreamExt as _;
 use gpui_kit::*;
 
-use crate::view::FilingView;
+use crate::{filing::Source, view::FilingView};
 
 actions!(fec_viewer, [Open, CloseWindow, Minimize, Zoom, Quit]);
 
@@ -26,7 +30,7 @@ pub fn open_filing_window(path: Option<PathBuf>, cx: &mut App) {
             .find(|(_, v)| !v.read(cx).has_filing());
         if let Some((handle, view)) = empty {
             let _ = handle.update(cx, |_, window, cx| {
-                view.update(cx, |v, cx| v.load(path, window, cx));
+                view.update(cx, |v, cx| v.load(Source::Path(path), window, cx));
                 window.activate_window();
             });
             return;
@@ -52,7 +56,7 @@ pub fn open_filing_window(path: Option<PathBuf>, cx: &mut App) {
         ..Default::default()
     };
     match gpui_kit::open_window(options, cx, |window, cx| {
-        cx.new(|cx| FilingView::new(path, window, cx))
+        cx.new(|cx| FilingView::new(path.map(Source::Path), window, cx))
     }) {
         Ok((handle, view)) => {
             cx.default_global::<OpenWindows>()
@@ -68,6 +72,7 @@ pub fn open_filing_window(path: Option<PathBuf>, cx: &mut App) {
 
 /// Run `f` on the active window. Deferred because actions dispatch while that
 /// window is mid-update, and a window can't be updated from inside itself.
+#[cfg(not(target_family = "wasm"))]
 fn with_active_window(cx: &mut App, f: impl FnOnce(&mut Window) + 'static) {
     cx.defer(|cx| {
         if let Some(window) = cx.active_window() {
@@ -77,6 +82,7 @@ fn with_active_window(cx: &mut App, f: impl FnOnce(&mut Window) + 'static) {
 }
 
 /// Finder / LaunchServices hand us `file://` URLs.
+#[cfg(not(target_family = "wasm"))]
 fn path_from_url(url: &str) -> Option<PathBuf> {
     let raw = url.strip_prefix("file://")?;
     let bytes = raw.as_bytes();
@@ -97,6 +103,12 @@ fn path_from_url(url: &str) -> Option<PathBuf> {
     Some(PathBuf::from(String::from_utf8(out).ok()?))
 }
 
+#[cfg(target_family = "wasm")]
+fn main() {
+    web::main();
+}
+
+#[cfg(not(target_family = "wasm"))]
 fn main() {
     let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
     let app = gpui_kit::application();

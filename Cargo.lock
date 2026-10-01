@@ -1818,8 +1818,13 @@ dependencies = [
  "fec-parser",
  "futures",
  "gpui-kit",
+ "js-sys",
  "objc2 0.6.4",
  "raw-window-handle",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
 ]
 
 [[package]]

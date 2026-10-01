@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -13,7 +12,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{prelude::FluentBuilder as _, *};
 
-use crate::filing::{CollectState, Collection, Matcher, OpenFiling, Schedule};
+use crate::filing::{CollectState, Collection, Matcher, OpenFiling, Schedule, Source};
 
 /// Cap on cached parsed rows; plenty for a screenful plus scroll-back.
 const ROW_CACHE_CAP: usize = 4_000;
@@ -166,7 +165,7 @@ pub struct FilingView {
 }
 
 impl FilingView {
-    pub fn new(path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(source: Option<Source>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let table = cx.new(|cx| {
             TableState::new(RowsDelegate::empty(), window, cx)
                 .col_movable(false)
@@ -192,8 +191,8 @@ impl FilingView {
             _poll: None,
             _subscriptions: vec![subscription, appearance],
         };
-        if let Some(path) = path {
-            this.load(path, window, cx);
+        if let Some(source) = source {
+            this.load(source, window, cx);
         }
         this
     }
@@ -202,19 +201,15 @@ impl FilingView {
         self.filing.is_some()
     }
 
-    pub fn load(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let title = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
-        window.set_window_title(&title);
+    pub fn load(&mut self, source: Source, window: &mut Window, cx: &mut Context<Self>) {
+        window.set_window_title(&source.title());
         window.set_window_edited(false);
 
         self.selection = Selection::Cover;
         self.collection = None;
         self.collapsed.clear();
         self.selected_row = None;
-        match OpenFiling::open(&path) {
+        match OpenFiling::open(source) {
             Ok(filing) => {
                 self.filing = Some(filing);
                 self.error = None;
@@ -225,6 +220,14 @@ impl FilingView {
                 self.error = Some(format!("{e:#}"));
             }
         }
+        cx.notify();
+    }
+
+    /// Report a filing that couldn't be loaded. Shown in the empty state, so
+    /// an open filing stays put.
+    #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+    pub fn show_error(&mut self, error: String, cx: &mut Context<Self>) {
+        self.error = Some(error);
         cx.notify();
     }
 
@@ -339,7 +342,7 @@ impl FilingView {
     ) {
         let mut paths = paths.paths().iter().cloned();
         if let Some(first) = paths.next() {
-            self.load(first, window, cx);
+            self.load(Source::Path(first), window, cx);
         }
         for extra in paths {
             crate::open_filing_window(Some(extra), cx);
@@ -697,11 +700,7 @@ fn render_empty(error: Option<String>, cx: &App) -> impl IntoElement {
         .justify_center()
         .gap_2()
         .child(div().text_lg().child("Drop a .fec file here"))
-        .child(
-            div()
-                .text_color(theme.muted_foreground)
-                .child("or choose File → Open… (⌘O / Ctrl+O)"),
-        )
+        .child(empty_hint(cx))
         .children(error.map(|e| {
             div()
                 .mt_4()
@@ -709,6 +708,33 @@ fn render_empty(error: Option<String>, cx: &App) -> impl IntoElement {
                 .text_color(theme.danger)
                 .child(e)
         }))
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn empty_hint(cx: &App) -> impl IntoElement {
+    div()
+        .text_color(cx.theme().muted_foreground)
+        .child("or choose File → Open… (⌘O / Ctrl+O)")
+}
+
+/// The browser has no File menu: offer a file picker and the bundled sample.
+#[cfg(target_family = "wasm")]
+fn empty_hint(_: &App) -> impl IntoElement {
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    h_flex()
+        .mt_2()
+        .gap_2()
+        .child(
+            Button::new("choose-file")
+                .label("Choose a file…")
+                .on_click(|_, _, _| crate::web::choose_file()),
+        )
+        .child(
+            Button::new("load-sample")
+                .primary()
+                .label("Load sample filing")
+                .on_click(|_, _, _| crate::web::fetch_file(crate::web::SAMPLE_FILE.into())),
+        )
 }
 
 fn format_count(n: usize) -> String {

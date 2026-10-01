@@ -4,16 +4,28 @@
 //! away. A background pass then counts records per record type (for the
 //! sidebar), and selecting a record type or schedule rescans the file and
 //! collects just those records.
+//!
+//! A filing is read from a [`Source`]: a path on disk (reopened for each
+//! pass) or bytes already in memory (the browser demo, which has no
+//! filesystem). Natively each pass runs on its own thread. In the browser,
+//! which has no threads, passes run on the page's event loop in short time
+//! slices so the UI keeps painting.
 
 use std::{
     fs::File,
+    io::{Cursor, Read},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
+#[cfg(target_family = "wasm")]
+use web_time::Instant;
 
 use anyhow::Context as _;
 use fec_parser::{Filing, report_code_label};
@@ -51,8 +63,53 @@ pub struct CountState {
     pub elapsed: Duration,
 }
 
+/// Where a filing's bytes come from.
+#[derive(Clone)]
+pub enum Source {
+    /// A file on disk, reopened for every pass.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    Path(PathBuf),
+    /// A whole file already in memory, shared by every pass.
+    #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+    Bytes { name: String, bytes: Arc<[u8]> },
+}
+
+impl Source {
+    /// What to call the filing in a window title.
+    pub fn title(&self) -> String {
+        match self {
+            Source::Path(path) => path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            Source::Bytes { name, .. } => name.clone(),
+        }
+    }
+
+    fn display(&self) -> String {
+        match self {
+            Source::Path(path) => path.display().to_string(),
+            Source::Bytes { name, .. } => name.clone(),
+        }
+    }
+
+    fn reader(&self) -> std::io::Result<Box<dyn Read + Send>> {
+        Ok(match self {
+            Source::Path(path) => Box::new(File::open(path)?),
+            Source::Bytes { bytes, .. } => Box::new(Cursor::new(bytes.clone())),
+        })
+    }
+
+    fn len(&self) -> Option<u64> {
+        match self {
+            Source::Path(path) => std::fs::metadata(path).map(|m| m.len()).ok(),
+            Source::Bytes { bytes, .. } => Some(bytes.len() as u64),
+        }
+    }
+}
+
 pub struct OpenFiling {
-    pub path: PathBuf,
+    pub source: Source,
     pub file_len: u64,
     pub summary: FilingSummary,
     pub counts: Arc<Mutex<CountState>>,
@@ -66,60 +123,47 @@ impl Drop for OpenFiling {
 }
 
 impl OpenFiling {
-    pub fn open(path: &Path) -> anyhow::Result<Arc<Self>> {
-        let filing = Filing::<File>::from_path(path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        let cover = &filing.cover;
-        let summary = FilingSummary {
-            filing_id: filing.filing_id.clone(),
-            filer_name: cover.filer_name.clone(),
-            filer_id: cover.filer_id.clone(),
-            form_type: cover.form_type.clone(),
-            report_label: cover.report_code.as_deref().map(report_code_label),
-            coverage_from: cover.coverage_from_date.map(|d| d.to_string()),
-            coverage_through: cover.coverage_through_date.map(|d| d.to_string()),
-            fec_version: filing.header.fec_version.clone(),
-            software: format!(
-                "{} {}",
-                filing.header.software_name, filing.header.software_version
-            ),
-            cover_kv: cover
-                .cover_record_kv
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        };
+    pub fn open(source: Source) -> anyhow::Result<Arc<Self>> {
+        let (summary, file_len) = match &source {
+            Source::Path(path) => Filing::<File>::from_path(path).map(summarize),
+            Source::Bytes { name, bytes } => {
+                let id = Path::new(name)
+                    .file_stem()
+                    .map_or_else(|| name.clone(), |s| s.to_string_lossy().into_owned());
+                Filing::from_reader(Cursor::new(bytes.clone()), id, bytes.len()).map(summarize)
+            }
+        }
+        .with_context(|| format!("Failed to read {}", source.display()))?;
 
         let counts = Arc::new(Mutex::new(CountState::default()));
         let cancel = Arc::new(AtomicBool::new(false));
-        {
-            let path = path.to_owned();
-            let counts = counts.clone();
-            let cancel = cancel.clone();
-            std::thread::Builder::new()
-                .name("fec-count".into())
-                .spawn(move || count_records(&path, &counts, &cancel))?;
-        }
+        spawn_pass(
+            "fec-count",
+            source.clone(),
+            cancel.clone(),
+            Counter::new(counts.clone()),
+        )?;
 
         Ok(Arc::new(Self {
-            path: path.to_owned(),
-            file_len: filing.source_length as u64,
+            source,
+            file_len,
             summary,
             counts,
             cancel,
         }))
     }
 
-    /// Rescan the file on a background thread, collecting records that match.
+    /// Rescan the file in the background, collecting records that match.
     pub fn collect(&self, matcher: Matcher) -> Collection {
         let state = Arc::new(Mutex::new(CollectState::default()));
         let cancel = Arc::new(AtomicBool::new(false));
-        let path = self.path.clone();
-        let thread_state = state.clone();
-        let thread_cancel = cancel.clone();
-        let spawned = std::thread::Builder::new()
-            .name("fec-collect".into())
-            .spawn(move || collect_records(&path, &matcher, &thread_state, &thread_cancel));
+        let collector = Collector::new(state.clone(), matcher);
+        let spawned = spawn_pass(
+            "fec-collect",
+            self.source.clone(),
+            cancel.clone(),
+            collector,
+        );
         if let Err(e) = spawned {
             let mut s = state.lock().expect("collect lock poisoned");
             s.error = Some(e.to_string());
@@ -127,6 +171,31 @@ impl OpenFiling {
         }
         Collection { state, cancel }
     }
+}
+
+/// The header and cover, plus the file's length.
+fn summarize<R: Read>(filing: Filing<R>) -> (FilingSummary, u64) {
+    let cover = &filing.cover;
+    let summary = FilingSummary {
+        filing_id: filing.filing_id.clone(),
+        filer_name: cover.filer_name.clone(),
+        filer_id: cover.filer_id.clone(),
+        form_type: cover.form_type.clone(),
+        report_label: cover.report_code.as_deref().map(report_code_label),
+        coverage_from: cover.coverage_from_date.map(|d| d.to_string()),
+        coverage_through: cover.coverage_through_date.map(|d| d.to_string()),
+        fec_version: filing.header.fec_version.clone(),
+        software: format!(
+            "{} {}",
+            filing.header.software_name, filing.header.software_version
+        ),
+        cover_kv: cover
+            .cover_record_kv
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    };
+    (summary, filing.source_length as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -203,88 +272,200 @@ impl Matcher {
 // Scanning
 // ---------------------------------------------------------------------------
 
-/// Call `f(row_type, record, byte_position)` for every record after the
-/// header and cover, skipping `[BEGINTEXT]` … `[ENDTEXT]` blocks the way
-/// `fec_parser` does. Stops early (returning `Ok`) once `cancel` is set.
-fn for_each_record(
-    path: &Path,
-    cancel: &AtomicBool,
-    mut f: impl FnMut(&str, &csv::ByteRecord, u64),
-) -> anyhow::Result<()> {
-    let file = File::open(path)?;
-    let mut rdr = csv::ReaderBuilder::new()
-        .delimiter(0x1c)
-        .flexible(true)
-        .has_headers(false)
-        .buffer_capacity(READ_BUFFER)
-        .from_reader(file);
-    let mut record = csv::ByteRecord::new();
-    let mut seen = 0usize;
-    let mut in_text = false;
-    while rdr.read_byte_record(&mut record)? {
-        seen += 1;
-        if seen <= 2 {
-            continue; // HDR + cover
-        }
-        if seen.is_multiple_of(4096) && cancel.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let first = record.get(0).unwrap_or_default();
-        if in_text {
-            in_text = first != b"[ENDTEXT]";
-            continue;
-        }
-        if first == b"[BEGINTEXT]" {
-            in_text = true;
-            continue;
-        }
-        let row_type = std::str::from_utf8(first).unwrap_or("").trim();
-        if row_type.is_empty() {
-            continue;
-        }
-        let pos = record.position().map(|p| p.byte()).unwrap_or(0);
-        f(row_type, &record, pos);
+/// Lines read between checks for cancellation.
+const SCAN_STEP: usize = 4096;
+
+/// Reads the records after the header and cover, skipping `[BEGINTEXT]` …
+/// `[ENDTEXT]` blocks the way `fec_parser` does.
+struct Scanner {
+    rdr: csv::Reader<Box<dyn Read + Send>>,
+    record: csv::ByteRecord,
+    seen: usize,
+    in_text: bool,
+}
+
+impl Scanner {
+    fn new(source: &Source) -> anyhow::Result<Self> {
+        let rdr = csv::ReaderBuilder::new()
+            .delimiter(0x1c)
+            .flexible(true)
+            .has_headers(false)
+            .buffer_capacity(READ_BUFFER)
+            .from_reader(source.reader()?);
+        Ok(Self {
+            rdr,
+            record: csv::ByteRecord::new(),
+            seen: 0,
+            in_text: false,
+        })
     }
+
+    /// Read up to `lines` more lines, handing each record to `pass` along
+    /// with its byte position. Returns `false` at the end of the file.
+    fn step(&mut self, lines: usize, pass: &mut impl Pass) -> anyhow::Result<bool> {
+        for _ in 0..lines {
+            if !self.rdr.read_byte_record(&mut self.record)? {
+                return Ok(false);
+            }
+            self.seen += 1;
+            if self.seen <= 2 {
+                continue; // HDR + cover
+            }
+            let first = self.record.get(0).unwrap_or_default();
+            if self.in_text {
+                self.in_text = first != b"[ENDTEXT]";
+                continue;
+            }
+            if first == b"[BEGINTEXT]" {
+                self.in_text = true;
+                continue;
+            }
+            let row_type = std::str::from_utf8(first).unwrap_or("").trim();
+            if row_type.is_empty() {
+                continue;
+            }
+            let pos = self.record.position().map(|p| p.byte()).unwrap_or(0);
+            pass.record(row_type, &self.record, pos);
+        }
+        Ok(true)
+    }
+}
+
+/// One scan over a filing's records, publishing into shared state.
+trait Pass: Send + 'static {
+    fn record(&mut self, row_type: &str, record: &csv::ByteRecord, pos: u64);
+    /// Called when the scan ends, unless it was cancelled.
+    fn finish(self, file_len: Option<u64>, result: anyhow::Result<()>);
+}
+
+/// Run `pass` to completion (or cancellation) on this thread.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
+fn run_pass(source: &Source, cancel: &AtomicBool, mut pass: impl Pass) {
+    let result = (|| {
+        let mut scanner = Scanner::new(source)?;
+        while !cancel.load(Ordering::Relaxed) && scanner.step(SCAN_STEP, &mut pass)? {}
+        anyhow::Ok(())
+    })();
+    if !cancel.load(Ordering::Relaxed) {
+        pass.finish(source.len(), result);
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn spawn_pass(
+    name: &str,
+    source: Source,
+    cancel: Arc<AtomicBool>,
+    pass: impl Pass,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || run_pass(&source, &cancel, pass))?;
     Ok(())
 }
 
-fn count_records(path: &Path, state: &Mutex<CountState>, cancel: &AtomicBool) {
-    let started = Instant::now();
-    let mut types: Vec<(String, usize)> = Vec::new();
-    let mut rows = 0usize;
-    let mut since_flush = 0usize;
-    let publish = |types: &[(String, usize)], rows, pos, done, error: Option<String>| {
-        let mut s = state.lock().expect("count lock poisoned");
-        s.types.clear();
-        s.types.extend_from_slice(types);
-        s.rows = rows;
-        s.bytes_scanned = pos;
-        s.elapsed = started.elapsed();
-        s.done = done;
-        s.error = error;
-    };
+/// The browser has one thread, shared with rendering and input. Scan in
+/// slices of a few milliseconds and hand the thread back between them, so a
+/// big filing fills in progressively instead of freezing the page.
+#[cfg(target_family = "wasm")]
+fn spawn_pass(
+    _name: &str,
+    source: Source,
+    cancel: Arc<AtomicBool>,
+    mut pass: impl Pass,
+) -> std::io::Result<()> {
+    const SLICE: Duration = Duration::from_millis(12);
 
-    let result = for_each_record(path, cancel, |row_type, _, pos| {
-        // A handful of distinct types per filing, so a linear scan beats hashing.
-        match types.iter_mut().find(|(t, _)| t == row_type) {
-            Some((_, n)) => *n += 1,
-            None => types.push((row_type.to_owned(), 1)),
+    async fn scan(
+        source: &Source,
+        cancel: &AtomicBool,
+        pass: &mut impl Pass,
+    ) -> anyhow::Result<()> {
+        let mut scanner = Scanner::new(source)?;
+        loop {
+            let slice = Instant::now();
+            while slice.elapsed() < SLICE {
+                if !scanner.step(256, pass)? {
+                    return Ok(());
+                }
+            }
+            yield_to_browser().await;
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(());
+            }
         }
-        rows += 1;
-        since_flush += 1;
-        if since_flush >= COUNT_FLUSH_EVERY {
-            since_flush = 0;
-            publish(&types, rows, pos, false, None);
+    }
+
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = scan(&source, &cancel, &mut pass).await;
+        if !cancel.load(Ordering::Relaxed) {
+            pass.finish(source.len(), result);
         }
     });
-    let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    publish(
-        &types,
-        rows,
-        file_len,
-        true,
-        result.err().map(|e| format!("{e:#}")),
-    );
+    Ok(())
+}
+
+/// Resolve on a fresh macrotask, so the browser can paint and handle input.
+#[cfg(target_family = "wasm")]
+async fn yield_to_browser() {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
+struct Counter {
+    state: Arc<Mutex<CountState>>,
+    started: Instant,
+    types: Vec<(String, usize)>,
+    rows: usize,
+    since_flush: usize,
+}
+
+impl Counter {
+    fn new(state: Arc<Mutex<CountState>>) -> Self {
+        Self {
+            state,
+            started: Instant::now(),
+            types: Vec::new(),
+            rows: 0,
+            since_flush: 0,
+        }
+    }
+
+    fn publish(&self, pos: u64, done: bool, error: Option<String>) {
+        let mut s = self.state.lock().expect("count lock poisoned");
+        s.types.clear();
+        s.types.extend_from_slice(&self.types);
+        s.rows = self.rows;
+        s.bytes_scanned = pos;
+        s.elapsed = self.started.elapsed();
+        s.done = done;
+        s.error = error;
+    }
+}
+
+impl Pass for Counter {
+    fn record(&mut self, row_type: &str, _: &csv::ByteRecord, pos: u64) {
+        // A handful of distinct types per filing, so a linear scan beats hashing.
+        match self.types.iter_mut().find(|(t, _)| t == row_type) {
+            Some((_, n)) => *n += 1,
+            None => self.types.push((row_type.to_owned(), 1)),
+        }
+        self.rows += 1;
+        self.since_flush += 1;
+        if self.since_flush >= COUNT_FLUSH_EVERY {
+            self.since_flush = 0;
+            self.publish(pos, false, None);
+        }
+    }
+
+    fn finish(self, file_len: Option<u64>, result: anyhow::Result<()>) {
+        let error = result.err().map(|e| format!("{e:#}"));
+        self.publish(file_len.unwrap_or(0), true, error);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -362,76 +543,76 @@ impl Drop for Collection {
     }
 }
 
-fn collect_records(
-    path: &Path,
-    matcher: &Matcher,
-    state: &Mutex<CollectState>,
-    cancel: &AtomicBool,
-) {
-    let started = Instant::now();
-    let mut chunk = Chunk::default();
-    let mut max_fields = 0usize;
-    let mut row_types: Vec<String> = Vec::new();
-    let mut last_pos = 0u64;
-    let publish = |chunk: Option<Chunk>,
-                   max_fields: usize,
-                   row_types: &[String],
-                   pos: u64,
-                   done: bool,
-                   error: Option<String>| {
-        let mut s = state.lock().expect("collect lock poisoned");
-        if let Some(chunk) = chunk.filter(|c| c.len() > 0) {
+struct Collector {
+    state: Arc<Mutex<CollectState>>,
+    matcher: Matcher,
+    started: Instant,
+    chunk: Chunk,
+    max_fields: usize,
+    row_types: Vec<String>,
+    last_pos: u64,
+    seen: usize,
+}
+
+impl Collector {
+    fn new(state: Arc<Mutex<CollectState>>, matcher: Matcher) -> Self {
+        Self {
+            state,
+            matcher,
+            started: Instant::now(),
+            chunk: Chunk::default(),
+            max_fields: 0,
+            row_types: Vec::new(),
+            last_pos: 0,
+            seen: 0,
+        }
+    }
+
+    fn publish(&mut self, pos: u64, done: bool, error: Option<String>) {
+        let chunk = std::mem::take(&mut self.chunk);
+        let mut s = self.state.lock().expect("collect lock poisoned");
+        if chunk.len() > 0 {
             s.rows += chunk.len();
             s.chunks.push(Arc::new(chunk));
         }
-        s.max_fields = max_fields;
-        if s.row_types.len() != row_types.len() {
-            s.row_types = row_types.to_vec();
+        s.max_fields = self.max_fields;
+        if s.row_types.len() != self.row_types.len() {
+            s.row_types = self.row_types.clone();
         }
         s.bytes_scanned = pos;
-        s.elapsed = started.elapsed();
+        s.elapsed = self.started.elapsed();
         s.done = done;
         s.error = error;
-    };
+    }
+}
 
-    let mut seen = 0usize;
-    let result = for_each_record(path, cancel, |row_type, record, pos| {
-        last_pos = pos;
-        seen += 1;
-        if seen.is_multiple_of(COUNT_FLUSH_EVERY) {
-            state.lock().expect("collect lock poisoned").bytes_scanned = pos;
+impl Pass for Collector {
+    fn record(&mut self, row_type: &str, record: &csv::ByteRecord, pos: u64) {
+        self.last_pos = pos;
+        self.seen += 1;
+        if self.seen.is_multiple_of(COUNT_FLUSH_EVERY) {
+            self.state
+                .lock()
+                .expect("collect lock poisoned")
+                .bytes_scanned = pos;
         }
-        if !matcher.matches(row_type) {
+        if !self.matcher.matches(row_type) {
             return;
         }
-        if !row_types.iter().any(|t| t == row_type) {
-            row_types.push(row_type.to_owned());
+        if !self.row_types.iter().any(|t| t == row_type) {
+            self.row_types.push(row_type.to_owned());
         }
-        max_fields = max_fields.max(record.len());
-        chunk.push(record);
-        if chunk.len() == CHUNK_ROWS {
-            publish(
-                Some(std::mem::take(&mut chunk)),
-                max_fields,
-                &row_types,
-                pos,
-                false,
-                None,
-            );
+        self.max_fields = self.max_fields.max(record.len());
+        self.chunk.push(record);
+        if self.chunk.len() == CHUNK_ROWS {
+            self.publish(pos, false, None);
         }
-    });
-    if cancel.load(Ordering::Relaxed) {
-        return;
     }
-    let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(last_pos);
-    publish(
-        Some(chunk),
-        max_fields,
-        &row_types,
-        file_len,
-        true,
-        result.err().map(|e| format!("{e:#}")),
-    );
+
+    fn finish(mut self, file_len: Option<u64>, result: anyhow::Result<()>) {
+        let error = result.err().map(|e| format!("{e:#}"));
+        self.publish(file_len.unwrap_or(self.last_pos), true, error);
+    }
 }
 
 #[cfg(test)]
@@ -463,16 +644,60 @@ mod tests {
         tempfile_path::TempPath::with_contents(&body)
     }
 
+    fn count_source(source: &Source) -> CountState {
+        let state = Arc::new(Mutex::new(CountState::default()));
+        run_pass(source, &AtomicBool::new(false), Counter::new(state.clone()));
+        Arc::into_inner(state).unwrap().into_inner().unwrap()
+    }
+
+    fn collect_source(source: &Source, matcher: Matcher) -> CollectState {
+        let state = Arc::new(Mutex::new(CollectState::default()));
+        run_pass(
+            source,
+            &AtomicBool::new(false),
+            Collector::new(state.clone(), matcher),
+        );
+        Arc::into_inner(state).unwrap().into_inner().unwrap()
+    }
+
     fn count(path: &Path) -> CountState {
-        let state = Mutex::new(CountState::default());
-        count_records(path, &state, &AtomicBool::new(false));
-        state.into_inner().unwrap()
+        count_source(&Source::Path(path.to_owned()))
     }
 
     fn collect(path: &Path, matcher: Matcher) -> CollectState {
-        let state = Mutex::new(CollectState::default());
-        collect_records(path, &matcher, &state, &AtomicBool::new(false));
-        state.into_inner().unwrap()
+        collect_source(&Source::Path(path.to_owned()), matcher)
+    }
+
+    /// The in-memory source the browser demo uses reads the same as a file.
+    #[test]
+    fn bytes_source_matches_path_source() {
+        let file = sample();
+        let bytes = Source::Bytes {
+            name: "1234.fec".into(),
+            bytes: std::fs::read(file.path()).unwrap().into(),
+        };
+        let (a, b) = (count(file.path()), count_source(&bytes));
+        assert_eq!(a.types, b.types);
+        assert_eq!((a.rows, a.bytes_scanned), (b.rows, b.bytes_scanned));
+
+        let matcher = Matcher::RowType("SA11AI".into());
+        let (a, b) = (
+            collect(file.path(), matcher.clone()),
+            collect_source(&bytes, matcher),
+        );
+        assert_eq!(a.rows, b.rows);
+        assert_eq!(
+            (0..a.rows).map(|i| a.row(i)).collect::<Vec<_>>(),
+            (0..b.rows).map(|i| b.row(i)).collect::<Vec<_>>()
+        );
+
+        let filing = OpenFiling::open(bytes).unwrap();
+        assert_eq!(filing.summary.filing_id, "1234");
+        assert_eq!(filing.summary.form_type, "F3XN");
+        assert_eq!(
+            filing.file_len,
+            std::fs::metadata(file.path()).unwrap().len()
+        );
     }
 
     #[test]
