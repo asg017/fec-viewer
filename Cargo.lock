@@ -1818,7 +1818,6 @@ dependencies = [
  "fec-parser",
  "futures",
  "gpui-kit",
- "memmap2",
  "objc2 0.6.4",
  "raw-window-handle",
 ]

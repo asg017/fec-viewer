@@ -1,30 +1,35 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
+use fec_parser::mappings::column_names_for_field;
 use gpui_kit::component::{
-    ActiveTheme as _, h_flex,
+    ActiveTheme as _, Icon, IconName, Sizable as _, h_flex,
     table::{Column, DataTable, TableDelegate, TableEvent, TableState},
     v_flex,
 };
 use gpui_kit::{prelude::FluentBuilder as _, *};
 
-use crate::index::FilingIndex;
+use crate::filing::{CollectState, Collection, Matcher, OpenFiling, Schedule};
 
 /// Cap on cached parsed rows; plenty for a screenful plus scroll-back.
 const ROW_CACHE_CAP: usize = 4_000;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum Selection {
     Cover,
-    Group(usize),
+    Records(Matcher),
 }
 
 // ---------------------------------------------------------------------------
-// Table delegate: one row type at a time, rows parsed lazily from the mmap.
+// Table delegate: rows from the current collection, parsed per row on demand.
 // ---------------------------------------------------------------------------
 
 pub struct RowsDelegate {
-    index: Option<Arc<FilingIndex>>,
-    group: usize,
+    state: Option<Arc<Mutex<CollectState>>>,
     columns: Vec<String>,
     row_count: usize,
     cache: HashMap<usize, Arc<Vec<String>>>,
@@ -33,8 +38,7 @@ pub struct RowsDelegate {
 impl RowsDelegate {
     fn empty() -> Self {
         Self {
-            index: None,
-            group: 0,
+            state: None,
             columns: Vec::new(),
             row_count: 0,
             cache: HashMap::new(),
@@ -54,16 +58,10 @@ impl RowsDelegate {
     }
 
     fn read_row(&self, row_ix: usize) -> Vec<String> {
-        let Some(index) = &self.index else {
-            return Vec::new();
-        };
-        let offset = {
-            let scan = index.scan.lock().expect("scan lock poisoned");
-            scan.groups
-                .get(self.group)
-                .and_then(|g| g.offsets.get(row_ix).copied())
-        };
-        offset.map(|o| index.read_row(o)).unwrap_or_default()
+        self.state
+            .as_ref()
+            .map(|s| s.lock().expect("collect lock poisoned").row(row_ix))
+            .unwrap_or_default()
     }
 }
 
@@ -112,13 +110,55 @@ impl TableDelegate for RowsDelegate {
 }
 
 // ---------------------------------------------------------------------------
+// Sidebar tree
+// ---------------------------------------------------------------------------
+
+struct Tree {
+    schedules: BTreeMap<Schedule, Vec<(String, usize)>>,
+    other: Vec<(String, usize)>,
+}
+
+impl Tree {
+    fn new(types: &[(String, usize)]) -> Self {
+        let mut schedules: BTreeMap<Schedule, Vec<(String, usize)>> = BTreeMap::new();
+        let mut other = Vec::new();
+        for (row_type, count) in types {
+            match Schedule::of(row_type) {
+                Some(s) => schedules
+                    .entry(s)
+                    .or_default()
+                    .push((row_type.clone(), *count)),
+                None => other.push((row_type.clone(), *count)),
+            }
+        }
+        for lines in schedules.values_mut() {
+            lines.sort_by_key(|(t, _)| natural_key(t));
+        }
+        Self { schedules, other }
+    }
+}
+
+/// Sort `SA9` before `SA11AI`: letters, then the first number, then the rest.
+fn natural_key(s: &str) -> (String, u64, String) {
+    let digits_at = s.find(|c: char| c.is_ascii_digit()).unwrap_or(s.len());
+    let (head, tail) = s.split_at(digits_at);
+    let digits_end = tail
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(tail.len());
+    let n = tail[..digits_end].parse().unwrap_or(0);
+    (head.to_owned(), n, tail[digits_end..].to_owned())
+}
+
+// ---------------------------------------------------------------------------
 // Window root view
 // ---------------------------------------------------------------------------
 
 pub struct FilingView {
-    index: Option<Arc<FilingIndex>>,
+    filing: Option<Arc<OpenFiling>>,
     error: Option<String>,
     selection: Selection,
+    collection: Option<Collection>,
+    collapsed: HashSet<Schedule>,
     selected_row: Option<usize>,
     table: Entity<TableState<RowsDelegate>>,
     _poll: Option<Task<()>>,
@@ -142,9 +182,11 @@ impl FilingView {
             gpui_kit::component::Theme::sync_system_appearance(Some(window), cx);
         });
         let mut this = Self {
-            index: None,
+            filing: None,
             error: None,
             selection: Selection::Cover,
+            collection: None,
+            collapsed: HashSet::new(),
             selected_row: None,
             table,
             _poll: None,
@@ -157,7 +199,7 @@ impl FilingView {
     }
 
     pub fn has_filing(&self) -> bool {
-        self.index.is_some()
+        self.filing.is_some()
     }
 
     pub fn load(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -168,23 +210,37 @@ impl FilingView {
         window.set_window_title(&title);
         window.set_window_edited(false);
 
-        match FilingIndex::open(&path) {
-            Ok(index) => {
-                self.index = Some(index);
+        self.selection = Selection::Cover;
+        self.collection = None;
+        self.collapsed.clear();
+        self.selected_row = None;
+        match OpenFiling::open(&path) {
+            Ok(filing) => {
+                self.filing = Some(filing);
                 self.error = None;
-                self.selection = Selection::Cover;
-                self.selected_row = None;
                 self.start_polling(cx);
             }
             Err(e) => {
-                self.index = None;
+                self.filing = None;
                 self.error = Some(format!("{e:#}"));
             }
         }
         cx.notify();
     }
 
-    /// While the background scan runs, refresh counts ~10x/second.
+    fn counting_done(&self) -> bool {
+        self.filing
+            .as_ref()
+            .is_none_or(|f| f.counts.lock().is_ok_and(|s| s.done))
+    }
+
+    fn collecting_done(&self) -> bool {
+        self.collection
+            .as_ref()
+            .is_none_or(|c| c.state.lock().is_ok_and(|s| s.done))
+    }
+
+    /// While a background pass runs, refresh ~10x/second.
     fn start_polling(&mut self, cx: &mut Context<Self>) {
         self._poll = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -193,11 +249,9 @@ impl FilingView {
                     .await;
                 let done = this
                     .update(cx, |this, cx| {
-                        this.sync_row_count(cx);
+                        this.sync_table(cx);
                         cx.notify();
-                        this.index
-                            .as_ref()
-                            .is_none_or(|i| i.scan.lock().is_ok_and(|s| s.done))
+                        this.counting_done() && this.collecting_done()
                     })
                     .unwrap_or(true);
                 if done {
@@ -207,33 +261,35 @@ impl FilingView {
         }));
     }
 
-    fn sync_row_count(&mut self, cx: &mut Context<Self>) {
-        let Selection::Group(group) = self.selection else {
+    /// Pull newly collected rows (and any extra columns) into the table.
+    fn sync_table(&mut self, cx: &mut Context<Self>) {
+        let (Some(collection), Some(filing)) = (&self.collection, &self.filing) else {
             return;
         };
-        let Some(index) = &self.index else { return };
-        let (count, ncols) = {
-            let scan = index.scan.lock().expect("scan lock poisoned");
-            scan.groups
-                .get(group)
-                .map(|g| (g.offsets.len(), g.columns.len()))
-                .unwrap_or_default()
+        let (rows, max_fields, first_type) = {
+            let s = collection.state.lock().expect("collect lock poisoned");
+            (s.rows, s.max_fields, s.row_types.first().cloned())
         };
+        let version = filing.summary.fec_version.clone();
         self.table.update(cx, |table, cx| {
             let d = table.delegate_mut();
-            let columns_changed = d.columns.len() != ncols;
-            if d.row_count != count || columns_changed {
-                d.row_count = count;
+            let mut columns_changed = false;
+            if d.columns.is_empty()
+                && let Some(t) = &first_type
+            {
+                d.columns = column_names_for_field(t, &version)
+                    .cloned()
+                    .unwrap_or_default();
+                columns_changed = true;
+            }
+            while d.columns.len() < max_fields {
+                let n = d.columns.len();
+                d.columns.push(format!("extra_{n}"));
+                columns_changed = true;
+            }
+            if d.row_count != rows || columns_changed {
+                d.row_count = rows;
                 if columns_changed {
-                    if let Some(g) = index
-                        .scan
-                        .lock()
-                        .expect("scan lock poisoned")
-                        .groups
-                        .get(group)
-                    {
-                        d.columns = g.columns.clone();
-                    }
                     table.refresh(cx);
                 }
                 cx.notify();
@@ -245,28 +301,32 @@ impl FilingView {
         if self.selection == selection {
             return;
         }
-        self.selection = selection;
+        self.selection = selection.clone();
         self.selected_row = None;
-        if let (Selection::Group(group), Some(index)) = (selection, &self.index) {
-            let (columns, count) = {
-                let scan = index.scan.lock().expect("scan lock poisoned");
-                scan.groups
-                    .get(group)
-                    .map(|g| (g.columns.clone(), g.offsets.len()))
-                    .unwrap_or_default()
-            };
-            let index = index.clone();
+        self.collection = None;
+        let Some(filing) = &self.filing else { return };
+        if let Selection::Records(matcher) = selection {
+            let collection = filing.collect(matcher);
+            let state = collection.state.clone();
+            self.collection = Some(collection);
             self.table.update(cx, |table, cx| {
                 let d = table.delegate_mut();
-                d.index = Some(index);
-                d.group = group;
-                d.columns = columns;
-                d.row_count = count;
+                d.state = Some(state);
+                d.columns.clear();
+                d.row_count = 0;
                 d.cache.clear();
                 table.clear_selection(cx);
                 table.refresh(cx);
                 table.scroll_to_row(0, cx);
             });
+            self.start_polling(cx);
+        }
+        cx.notify();
+    }
+
+    fn toggle_schedule(&mut self, schedule: Schedule, cx: &mut Context<Self>) {
+        if !self.collapsed.remove(&schedule) {
+            self.collapsed.insert(schedule);
         }
         cx.notify();
     }
@@ -299,7 +359,7 @@ impl Render for FilingView {
             .on_drop(cx.listener(Self::on_drop_paths))
             .drag_over::<ExternalPaths>(|style, _, _, cx| style.bg(cx.theme().drop_target));
 
-        match (&self.index, &self.error) {
+        match (&self.filing, &self.error) {
             (Some(_), _) => root
                 .child(self.render_header(cx))
                 .child(
@@ -318,10 +378,10 @@ impl Render for FilingView {
 impl FilingView {
     fn render_header(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let Some(index) = &self.index else {
+        let Some(filing) = &self.filing else {
             return div();
         };
-        let s = &index.summary;
+        let s = &filing.summary;
         let id = if s.filing_id.bytes().all(|b| b.is_ascii_digit()) {
             format!("FEC-{}", s.filing_id)
         } else {
@@ -370,33 +430,34 @@ impl FilingView {
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let groups: Vec<(String, usize)> = self
-            .index
+        let tree = self
+            .filing
             .as_ref()
-            .map(|i| {
-                let scan = i.scan.lock().expect("scan lock poisoned");
-                scan.groups
-                    .iter()
-                    .map(|g| (g.row_type.clone(), g.offsets.len()))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .map(|f| Tree::new(&f.counts.lock().expect("count lock poisoned").types))
+            .unwrap_or_else(|| Tree::new(&[]));
 
-        let item = |id: ElementId, label: String, count: Option<usize>, selected: bool| {
+        let item = |id: ElementId,
+                    leading: Option<AnyElement>,
+                    label: String,
+                    count: Option<usize>,
+                    depth: usize,
+                    selected: bool| {
             h_flex()
                 .id(id)
-                .px_3()
+                .pl(px(8. + depth as f32 * 18.))
+                .pr_3()
                 .py_1()
                 .mx_1()
+                .gap_1()
                 .rounded_md()
-                .justify_between()
                 .cursor_pointer()
                 .when(selected, |d| {
                     d.bg(theme.sidebar_accent)
                         .text_color(theme.sidebar_accent_foreground)
                 })
                 .when(!selected, |d| d.hover(|d| d.bg(theme.list_hover)))
-                .child(div().font_family("monospace").child(label))
+                .children(leading)
+                .child(div().flex_1().min_w_0().truncate().child(label))
                 .children(count.map(|c| {
                     div()
                         .text_xs()
@@ -404,6 +465,7 @@ impl FilingView {
                         .child(format_count(c))
                 }))
         };
+        let is_selected = |m: &Matcher| matches!(&self.selection, Selection::Records(s) if s == m);
 
         let mut list = v_flex()
             .id("sidebar")
@@ -419,8 +481,10 @@ impl FilingView {
             .child(
                 item(
                     "cover".into(),
+                    None,
                     "Cover".into(),
                     None,
+                    0,
                     self.selection == Selection::Cover,
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.select(Selection::Cover, cx))),
@@ -432,31 +496,95 @@ impl FilingView {
                     .pb_1()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child("ROW TYPES"),
+                    .child("RECORDS"),
             );
-        for (ix, (row_type, count)) in groups.into_iter().enumerate() {
-            let selected = self.selection == Selection::Group(ix);
+
+        for (schedule, lines) in tree.schedules {
+            let total = lines.iter().map(|(_, n)| n).sum();
+            let collapsed = self.collapsed.contains(&schedule);
+            let matcher = Matcher::Schedule(schedule);
+            let chevron = div()
+                .id(ElementId::Name(
+                    format!("toggle-{}", schedule.label()).into(),
+                ))
+                .flex_shrink_0()
+                .child(
+                    Icon::new(if collapsed {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .xsmall(),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle_schedule(schedule, cx);
+                }));
             list = list.child(
-                item(("group", ix).into(), row_type, Some(count), selected).on_click(
-                    cx.listener(move |this, _, _, cx| this.select(Selection::Group(ix), cx)),
-                ),
+                item(
+                    ElementId::Name(format!("schedule-{}", schedule.label()).into()),
+                    Some(chevron.into_any_element()),
+                    schedule.label().into(),
+                    Some(total),
+                    0,
+                    is_selected(&matcher),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.select(Selection::Records(matcher.clone()), cx)
+                })),
+            );
+            if collapsed {
+                continue;
+            }
+            for (row_type, count) in lines {
+                let matcher = Matcher::RowType(row_type.clone());
+                list = list.child(
+                    item(
+                        ElementId::Name(format!("line-{row_type}").into()),
+                        None,
+                        schedule.line_label(&row_type),
+                        Some(count),
+                        1,
+                        is_selected(&matcher),
+                    )
+                    .font_family("monospace")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select(Selection::Records(matcher.clone()), cx)
+                    })),
+                );
+            }
+        }
+        for (row_type, count) in tree.other {
+            let matcher = Matcher::RowType(row_type.clone());
+            list = list.child(
+                item(
+                    ElementId::Name(format!("other-{row_type}").into()),
+                    None,
+                    row_type,
+                    Some(count),
+                    0,
+                    is_selected(&matcher),
+                )
+                .font_family("monospace")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.select(Selection::Records(matcher.clone()), cx)
+                })),
             );
         }
         list
     }
 
-    fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let _ = window;
+    fn render_main(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match self.selection {
             Selection::Cover => {
                 let kv = self
-                    .index
+                    .filing
                     .as_ref()
-                    .map(|i| i.summary.cover_kv.clone())
+                    .map(|f| f.summary.cover_kv.clone())
                     .unwrap_or_default();
                 render_kv("cover-kv", kv, cx).into_any_element()
             }
-            Selection::Group(_) => h_flex()
+            Selection::Records(_) => h_flex()
                 .size_full()
                 .child(
                     div()
@@ -488,32 +616,41 @@ impl FilingView {
 
     fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let text = self
-            .index
-            .as_ref()
-            .map(|index| {
-                let scan = index.scan.lock().expect("scan lock poisoned");
-                let size = format_bytes(index.file_len);
-                if let Some(err) = &scan.error {
+        let mut parts = Vec::new();
+        if let Some(filing) = &self.filing {
+            let size = format_bytes(filing.file_len);
+            let c = filing.counts.lock().expect("count lock poisoned");
+            parts.push(if let Some(err) = &c.error {
+                format!("{} records · stopped early: {err}", format_count(c.rows))
+            } else if c.done {
+                format!(
+                    "{} · {size} · counted in {:.2}s",
+                    plural(c.rows, "record"),
+                    c.elapsed.as_secs_f64()
+                )
+            } else {
+                let pct = c.bytes_scanned as f64 / filing.file_len.max(1) as f64 * 100.0;
+                format!(
+                    "Counting… {pct:.0}% · {} records · {size}",
+                    format_count(c.rows)
+                )
+            });
+            if let Some(collection) = &self.collection {
+                let s = collection.state.lock().expect("collect lock poisoned");
+                parts.push(if let Some(err) = &s.error {
+                    format!("load stopped early: {err}")
+                } else if s.done {
                     format!(
-                        "{} rows · stopped early: {err}",
-                        format_count(scan.rows_scanned)
-                    )
-                } else if scan.done {
-                    format!(
-                        "{} · {size} · indexed in {:.2}s",
-                        plural(scan.rows_scanned, "row"),
-                        scan.elapsed.as_secs_f64()
+                        "{} loaded in {:.2}s",
+                        plural(s.rows, "row"),
+                        s.elapsed.as_secs_f64()
                     )
                 } else {
-                    let pct = scan.bytes_scanned as f64 / index.file_len.max(1) as f64 * 100.0;
-                    format!(
-                        "Indexing… {pct:.0}% · {} rows · {size}",
-                        format_count(scan.rows_scanned)
-                    )
-                }
-            })
-            .unwrap_or_default();
+                    let pct = s.bytes_scanned as f64 / filing.file_len.max(1) as f64 * 100.0;
+                    format!("Loading… {pct:.0}% · {} rows", format_count(s.rows))
+                });
+            }
+        }
         h_flex()
             .px_3()
             .py_1()
@@ -522,7 +659,7 @@ impl FilingView {
             .bg(theme.status_bar)
             .border_t_1()
             .border_color(theme.status_bar_border)
-            .child(text)
+            .child(parts.join("   ·   "))
     }
 }
 

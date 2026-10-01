@@ -9,7 +9,6 @@ fec-parser = { git = "https://github.com/asg017/libfec", rev = "a1660e5782f62ed2
 gpui-kit = "0.7.0"
 anyhow = "1"
 csv = "1.2.2"
-memmap2 = "0.9"
 futures = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
