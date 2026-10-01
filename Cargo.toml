@@ -1,0 +1,16 @@
+[package]
+name = "fec-viewer"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[dependencies]
+fec-parser = { git = "https://github.com/asg017/libfec", rev = "a1660e5782f62ed285ba5880070a6ae82a626c4e" }  # branch fec-parser-byte-offset
+gpui-kit = "0.7.0"
+anyhow = "1"
+csv = "1.2.2"
+memmap2 = "0.9"
+futures = "0.3"
+
+[profile.release]
+lto = "thin"

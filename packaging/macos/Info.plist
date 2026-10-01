@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>FEC Viewer</string>
+  <key>CFBundleDisplayName</key><string>FEC Viewer</string>
+  <key>CFBundleIdentifier</key><string>dev.libfec.viewer</string>
+  <key>CFBundleExecutable</key><string>fec-viewer</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>0.0.1</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+
+  <!-- Declare the .fec type so Finder knows what it is... -->
+  <key>UTExportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key><string>gov.fec.filing</string>
+      <key>UTTypeDescription</key><string>FEC Electronic Filing</string>
+      <key>UTTypeConformsTo</key>
+      <array><string>public.data</string><string>public.content</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>fec</string></array>
+      </dict>
+    </dict>
+  </array>
+
+  <!-- ...and claim it as the default viewer. -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>FEC Electronic Filing</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Owner</string>
+      <key>LSItemContentTypes</key><array><string>gov.fec.filing</string></array>
+    </dict>
+  </array>
+</dict>
+</plist>
