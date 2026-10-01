@@ -6,109 +6,47 @@
     <title>FEC Viewer</title>
     <meta name="description" content="A fast, native desktop app for exploring .fec campaign finance filings. Try it in your browser." />
     <style>
-      :root {
-        --bg: #fbfbfa;
-        --fg: #16181b;
-        --muted: #5d636b;
-        --line: #e3e4e2;
-        --card: #ffffff;
-        --accent: #1f5fbf;
-        --accent-fg: #ffffff;
-        --shadow: 0 1px 2px rgb(0 0 0 / 0.04), 0 12px 32px rgb(0 0 0 / 0.08);
-      }
-      @media (prefers-color-scheme: dark) {
-        :root:not([data-theme="light"]) {
-          --bg: #111214;
-          --fg: #ececea;
-          --muted: #9ba1a8;
-          --line: #2a2c30;
-          --card: #18191c;
-          --accent: #6ea1ff;
-          --accent-fg: #0b1220;
-          --shadow: 0 1px 2px rgb(0 0 0 / 0.3), 0 12px 32px rgb(0 0 0 / 0.4);
-        }
-      }
-      * { box-sizing: border-box; }
-      html { -webkit-text-size-adjust: 100%; }
+      :root { color-scheme: light dark; }
       body {
-        margin: 0;
-        background: var(--bg);
-        color: var(--fg);
-        font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+        max-width: 42em;
+        margin: 0 auto;
+        padding: 2em 16px;
+        font: 17px/1.5 Georgia, "Times New Roman", serif;
       }
-      main { max-width: 960px; margin: 0 auto; padding: 64px 16px 48px; }
-      .eyebrow {
-        display: inline-block;
-        font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
-        color: var(--muted);
-        border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px;
-      }
-      h1 { font-size: clamp(32px, 6vw, 48px); line-height: 1.1; letter-spacing: -0.02em; margin: 16px 0 12px; }
-      .lede { font-size: 18px; color: var(--muted); max-width: 40em; margin: 0 0 28px; }
-      code { font: 0.92em ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
-      .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 48px; }
-      .btn {
-        display: inline-flex; align-items: center; gap: 8px;
-        padding: 10px 18px; border-radius: 8px;
-        font-weight: 600; text-decoration: none;
-        border: 1px solid var(--line); color: var(--fg); background: var(--card);
-      }
-      .btn:hover { border-color: var(--muted); }
-      .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
-      .btn.primary:hover { filter: brightness(1.08); }
-      figure { margin: 0 0 56px; }
-      figure img {
-        display: block; width: 100%; height: auto;
-        border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow);
-      }
-      figcaption { font-size: 14px; color: var(--muted); margin-top: 12px; text-align: center; }
-      .features { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 24px; margin-bottom: 56px; }
-      .features h2 { font-size: 16px; margin: 0 0 6px; }
-      .features p { margin: 0; color: var(--muted); font-size: 15px; }
-      footer { border-top: 1px solid var(--line); padding-top: 20px; font-size: 14px; color: var(--muted); }
-      a { color: var(--accent); }
+      h1 { font-size: 1.8em; margin: 0.5em 0 0.25em; }
+      img { display: block; max-width: 100%; height: auto; border: 1px solid #8884; }
+      code { font-size: 0.9em; }
+      ul { padding-left: 1.2em; }
+      footer { margin-top: 3em; font-size: 0.9em; opacity: 0.7; }
     </style>
   </head>
   <body>
-    <main>
-      <span class="eyebrow">Experimental · alpha</span>
-      <h1>FEC Viewer</h1>
-      <p class="lede">
-        A fast desktop app for exploring <code>.fec</code> files, the electronic
-        filings committees submit to the Federal Election Commission. Open a
-        filing to browse its cover page, schedules and every itemized record.
-      </p>
-      <div class="actions">
-        <a class="btn primary" href="./demo/">Try it in your browser →</a>
-        <a class="btn" href="https://github.com/asg017/fec-viewer/releases">Download for macOS / Windows</a>
-        <a class="btn" href="https://github.com/asg017/fec-viewer">Source on GitHub</a>
-      </div>
+    <h1>FEC Viewer</h1>
 
-      <figure>
-        <img src="./screenshot.png" width="1280" height="800"
-             alt="FEC Viewer showing a filing's Schedule A contributions in a table, with a sidebar of schedules and a detail panel for the selected record." />
-        <figcaption>The browser demo runs the same native UI, compiled to WebAssembly.</figcaption>
-      </figure>
+    <p>
+      A desktop app for exploring <code>.fec</code> files, the electronic
+      filings committees submit to the Federal Election Commission. Open a
+      filing to browse its cover page, schedules and every itemized record.
+    </p>
 
-      <section class="features">
-        <div>
-          <h2>Opens big filings instantly</h2>
-          <p>The header and cover load right away; records stream in from a background scan.</p>
-        </div>
-        <div>
-          <h2>Organized by schedule</h2>
-          <p>Records are grouped into Schedules A, B, E and more, with counts for every line number.</p>
-        </div>
-        <div>
-          <h2>Nothing to install to try</h2>
-          <p>Drop a <code>.fec</code> file on the demo page. It's parsed entirely in your browser and never uploaded.</p>
-        </div>
-      </section>
+    <p>
+      <a href="./demo/">Try it in your browser</a> ·
+      <a href="https://github.com/asg017/fec-viewer/releases">Download for macOS / Windows</a> ·
+      <a href="https://github.com/asg017/fec-viewer">Source on GitHub</a>
+    </p>
 
-      <footer>
-        Built with <a href="https://github.com/asg017/libfec">libfec</a> and
-        <a href="https://gpui.rs/">GPUI</a>. Not affiliated with the FEC.
-      </footer>
-    </main>
+    <p>
+      <img src="./screenshot.png" width="1280" height="800"
+           alt="FEC Viewer showing a filing's Schedule A contributions in a table, with a sidebar of schedules and a detail panel for the selected record." />
+    </p>
+
+    <p>
+      The browser demo runs the same native UI compiled to WebAssembly. Drop a <code>.fec</code> file on it; it's parsed entirely in your browser and never uploaded anywhere.
+    </p>
+
+    <footer>
+      Built with <a href="https://github.com/asg017/libfec">libfec</a> and
+      <a href="https://gpui.rs/">GPUI</a>. Not affiliated with the FEC.
+    </footer>
   </body>
 </html>
