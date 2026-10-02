@@ -62,7 +62,8 @@ pub struct FilingSummary {
 impl FilingSummary {
     /// The filing's page on docquery.fec.gov, for filings with a numeric ID.
     pub fn fec_url(&self) -> Option<String> {
-        let numeric = !self.filing_id.is_empty() && self.filing_id.bytes().all(|b| b.is_ascii_digit());
+        let numeric =
+            !self.filing_id.is_empty() && self.filing_id.bytes().all(|b| b.is_ascii_digit());
         (numeric && !self.filer_id.is_empty()).then(|| {
             format!(
                 "https://docquery.fec.gov/cgi-bin/forms/{}/{}",

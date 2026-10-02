@@ -68,18 +68,6 @@ fn race_text(f: &Form2) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
-/// `"CA-32"` for a House seat, `"CA"` for a Senate seat. District `00`
-/// (common on Senate and presidential filings) is left off.
-pub(super) fn seat_text(state: Option<&str>, district: Option<&str>) -> Option<String> {
-    let district = district.filter(|d| !d.trim().is_empty() && d.trim() != "00");
-    match (state, district) {
-        (Some(state), Some(district)) => Some(format!("{state}-{district}")),
-        (Some(state), None) => Some(state.to_string()),
-        (None, Some(district)) => Some(format!("District {district}")),
-        (None, None) => None,
-    }
-}
-
 /// Lines 1–6 plus the running mate.
 fn candidate(f: &Form2, cx: &App) -> AnyElement {
     let id = (!f.candidate_id.is_empty()).then_some(f.candidate_id.as_str());
@@ -133,17 +121,4 @@ fn committee(title: &str, line: &str, c: &Form2Committee, cx: &App) -> AnyElemen
         ));
     }
     section_with(title, Some(line), children, cx)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::seat_text;
-
-    #[test]
-    fn formats_seats() {
-        assert_eq!(seat_text(Some("CA"), Some("32")).as_deref(), Some("CA-32"));
-        assert_eq!(seat_text(Some("TX"), Some("00")).as_deref(), Some("TX"));
-        assert_eq!(seat_text(Some("TX"), None).as_deref(), Some("TX"));
-        assert_eq!(seat_text(None, None), None);
-    }
 }

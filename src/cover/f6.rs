@@ -6,7 +6,6 @@
 use fec_parser::covers::Form6;
 use gpui_kit::*;
 
-use super::f2::seat_text;
 use super::layout::*;
 
 pub fn render(f: &Form6, cx: &App) -> Vec<AnyElement> {

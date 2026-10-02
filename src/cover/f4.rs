@@ -109,8 +109,14 @@ fn cash_summary(f: &Form4, cx: &App) -> AnyElement {
         .row("6(d) Subtotal", &s.line6d_subtotal)
         .row("7. Total disbursements", &s.line7_total_disbursements)
         .total("8. Cash on hand at close of period", close)
-        .amount("9. Debts owed TO the committee", s.line9_debts_owed_to_committee)
-        .amount("10. Debts owed BY the committee", s.line10_debts_owed_by_committee);
+        .amount(
+            "9. Debts owed TO the committee",
+            s.line9_debts_owed_to_committee,
+        )
+        .amount(
+            "10. Debts owed BY the committee",
+            s.line10_debts_owed_by_committee,
+        );
     let mut children = vec![table.render(cx)];
     // The instructions say Line 8 "should be the same for both columns".
     if (close.column_a - close.column_b).abs() >= 0.005 {
@@ -127,7 +133,10 @@ fn cash_summary(f: &Form4, cx: &App) -> AnyElement {
 fn limitation(f: &Form4, cx: &App) -> AnyElement {
     let s = &f.summary;
     let table = MoneyTable::new(COLUMNS)
-        .row("11. Convention expenditures", &s.line11_convention_expenditures)
+        .row(
+            "11. Convention expenditures",
+            &s.line11_convention_expenditures,
+        )
         .row(
             "12. Refunds, rebates and returns of deposits",
             &s.line12_convention_refunds,
@@ -157,8 +166,10 @@ fn limitation(f: &Form4, cx: &App) -> AnyElement {
 /// Detailed Summary Page, receipts (Lines 13–20).
 fn receipts(f: &Form4, cx: &App) -> AnyElement {
     let r = &f.detailed_summary.receipts;
-    let table = MoneyTable::new(COLUMNS)
-        .row("13. Federal funds (Presidential Election Campaign Fund)", &r.line13_federal_funds);
+    let table = MoneyTable::new(COLUMNS).row(
+        "13. Federal funds (Presidential Election Campaign Fund)",
+        &r.line13_federal_funds,
+    );
     let table = itemized(
         table,
         "14. Contributions to defray convention expenses:",
@@ -186,7 +197,12 @@ fn receipts(f: &Form4, cx: &App) -> AnyElement {
     );
     let table = itemized(table, "19. Other income:", &r.line19_other_income)
         .total("20. Total receipts", &r.line20_total_receipts);
-    section_with("Receipts", Some("Detailed Summary · Lines 13–20"), vec![table.render(cx)], cx)
+    section_with(
+        "Receipts",
+        Some("Detailed Summary · Lines 13–20"),
+        vec![table.render(cx)],
+        cx,
+    )
 }
 
 /// Detailed Summary Page, disbursements (Lines 21–25).
@@ -207,8 +223,12 @@ fn disbursements(f: &Form4, cx: &App) -> AnyElement {
         ("  (a) Loans made", "  (b) Loan repayments made"),
         &d.line23_loans_made,
     );
-    let table = itemized(table, "24. Other disbursements:", &d.line24_other_disbursements)
-        .total("25. Total disbursements", &d.line25_total_disbursements);
+    let table = itemized(
+        table,
+        "24. Other disbursements:",
+        &d.line24_other_disbursements,
+    )
+    .total("25. Total disbursements", &d.line25_total_disbursements);
     section_with(
         "Disbursements",
         Some("Detailed Summary · Lines 21–25"),

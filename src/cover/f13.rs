@@ -86,8 +86,14 @@ fn identification(f: &Form13, cx: &App) -> AnyElement {
 /// Lines 5–7, "Cumulative Total (From Committee's Inception)".
 fn totals(f: &Form13, cx: &App) -> AnyElement {
     let table = MoneyTable::new(Columns::One)
-        .amount("5. Total donations accepted", f.line5_total_donations_accepted)
-        .amount("6. Total donations refunded", f.line6_total_donations_refunded)
+        .amount(
+            "5. Total donations accepted",
+            f.line5_total_donations_accepted,
+        )
+        .amount(
+            "6. Total donations refunded",
+            f.line6_total_donations_refunded,
+        )
         .amount_total("7. Net donations", f.line7_net_donations);
     let mut children = vec![table.render(cx)];
     if f.report_code.as_deref() == Some("90S") {

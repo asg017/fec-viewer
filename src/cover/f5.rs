@@ -97,27 +97,3 @@ fn report(f: &Form5, cx: &App) -> AnyElement {
         .date("Date signed", f.date_signed);
     section_with("Report", Some("Lines 4–5"), vec![fields.render(cx)], cx)
 }
-
-/// The electronic-format `entity_type` code as `"Organization (ORG)"`.
-// Hoisting candidate: Form 9 has the same helper.
-fn entity_label(code: &str) -> String {
-    let label = match code.trim().to_ascii_uppercase().as_str() {
-        "IND" => Some("Individual"),
-        "ORG" => Some("Organization"),
-        "COM" => Some("Committee"),
-        "PAC" => Some("PAC"),
-        "PTY" => Some("Party organization"),
-        _ => None,
-    };
-    code_with_label(code.trim(), label)
-}
-
-/// A `Y` / `N` column as `"Yes"` / `"No"`, or the raw value otherwise.
-// Hoisting candidate: Form 9 has the same helper.
-fn yes_no_code(code: &str) -> String {
-    match code.trim() {
-        "Y" | "y" => "Yes".into(),
-        "N" | "n" => "No".into(),
-        other => other.into(),
-    }
-}

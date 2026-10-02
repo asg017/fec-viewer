@@ -113,9 +113,41 @@ pub fn period_text(
     }
 }
 
-/// `"Yes"` / `"No"`.
-pub fn yes_no(b: bool) -> &'static str {
-    if b { "Yes" } else { "No" }
+/// `"CA-32"` for a House seat, `"CA"` for a Senate seat. A blank or all-zero
+/// district (`00`, common on Senate and presidential filings) is left off.
+pub fn seat_text(state: Option<&str>, district: Option<&str>) -> Option<String> {
+    let state = state.map(str::trim).filter(|s| !s.is_empty());
+    let district = district
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && !d.bytes().all(|b| b == b'0'));
+    match (state, district) {
+        (Some(state), Some(district)) => Some(format!("{state}-{district}")),
+        (Some(state), None) => Some(state.to_string()),
+        (None, Some(district)) => Some(format!("District {district}")),
+        (None, None) => None,
+    }
+}
+
+/// An electronic-format `entity_type` code as `"Organization (ORG)"`.
+pub fn entity_label(code: &str) -> String {
+    let label = match code.trim().to_ascii_uppercase().as_str() {
+        "IND" => Some("Individual"),
+        "ORG" => Some("Organization"),
+        "COM" => Some("Committee"),
+        "PAC" => Some("PAC"),
+        "PTY" => Some("Party organization"),
+        _ => None,
+    };
+    code_with_label(code.trim(), label)
+}
+
+/// A `Y` / `N` column as `"Yes"` / `"No"`, or the raw value otherwise.
+pub fn yes_no_code(code: &str) -> String {
+    match code.trim() {
+        "Y" | "y" => "Yes".into(),
+        "N" | "n" => "No".into(),
+        other => other.into(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -124,26 +156,15 @@ pub fn yes_no(b: bool) -> &'static str {
 
 /// The scrolling page every cover is laid out in.
 pub fn page(id: impl Into<ElementId>, children: Vec<AnyElement>) -> impl IntoElement {
-    // TEMP (dev only, remove before merge): skip the first N page children so
-    // screenshots can reach sections below the fold.
-    let skip = std::env::var("FEC_VIEWER_SKIP_SECTIONS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let children: Vec<AnyElement> = children.into_iter().skip(skip).collect();
-    div()
-        .id(id.into())
-        .size_full()
-        .overflow_y_scroll()
-        .child(
-            v_flex()
-                .w_full()
-                .max_w(px(PAGE_MAX_WIDTH))
-                .mx_auto()
-                .p_5()
-                .gap_4()
-                .children(children),
-        )
+    div().id(id.into()).size_full().overflow_y_scroll().child(
+        v_flex()
+            .w_full()
+            .max_w(px(PAGE_MAX_WIDTH))
+            .mx_auto()
+            .p_5()
+            .gap_4()
+            .children(children),
+    )
 }
 
 /// How a [`tag`] is colored.
@@ -244,11 +265,7 @@ pub fn amendment_tag(is_amendment: bool, cx: &App) -> Option<AnyElement> {
 }
 
 /// A titled card.
-pub fn section(
-    title: impl Into<SharedString>,
-    children: Vec<AnyElement>,
-    cx: &App,
-) -> AnyElement {
+pub fn section(title: impl Into<SharedString>, children: Vec<AnyElement>, cx: &App) -> AnyElement {
     section_with(title, None, children, cx)
 }
 
@@ -276,11 +293,7 @@ pub fn section_with(
                 .bg(theme.muted.opacity(0.5))
                 .border_b_1()
                 .border_color(theme.border)
-                .child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(title.into()),
-                )
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(title.into()))
                 .children(aside.map(|a| {
                     div()
                         .text_xs()
@@ -346,8 +359,10 @@ impl Fields {
     pub fn text(mut self, label: &str, value: impl Into<String>) -> Self {
         let value = value.into();
         if !value.trim().is_empty() {
-            self.rows
-                .push((label.to_string().into(), div().child(value).into_any_element()));
+            self.rows.push((
+                label.to_string().into(),
+                div().child(value).into_any_element(),
+            ));
         }
         self
     }
@@ -391,7 +406,13 @@ impl Fields {
     }
 
     /// A person's name with a muted aside after it (e.g. their title).
-    pub fn person_with(self, label: &str, name: &PersonName, aside: Option<&str>, cx: &App) -> Self {
+    pub fn person_with(
+        self,
+        label: &str,
+        name: &PersonName,
+        aside: Option<&str>,
+        cx: &App,
+    ) -> Self {
         if name.is_empty() {
             return self;
         }
@@ -570,9 +591,11 @@ pub fn stats(tiles: Vec<Stat>, cx: &App) -> AnyElement {
                         .when(t.amount < -0.005, |d| d.text_color(theme.danger))
                         .child(format_usd(t.amount)),
                 )
-                .children(t.detail.map(|(text, tone)| {
-                    div().text_xs().text_color(tone.color(theme)).child(text)
-                }))
+                .children(
+                    t.detail.map(|(text, tone)| {
+                        div().text_xs().text_color(tone.color(theme)).child(text)
+                    }),
+                )
         }))
         .into_any_element()
 }
@@ -745,9 +768,7 @@ impl MoneyTable {
                 .gap_2()
                 .py_0p5()
                 .items_start()
-                .when(total, |d| {
-                    d.border_t_1().border_color(theme.border).pt_1()
-                })
+                .when(total, |d| d.border_t_1().border_color(theme.border).pt_1())
                 .child(label_cell(&label, total))
                 .child(amount_cell(a, total))
                 .when(two, |d| d.child(amount_cell(b, total)))
@@ -762,20 +783,177 @@ impl MoneyTable {
     }
 }
 
-/// Render a list of `(label, amount)` pairs as a one-column table, skipping
-/// nothing (zero amounts are meaningful on a summary page).
-pub fn amounts_table(rows: &[(&str, f64)], cx: &App) -> AnyElement {
-    rows.iter()
-        .fold(MoneyTable::new(Columns::One), |t, (label, amount)| {
-            t.amount(label, *amount)
+// ---------------------------------------------------------------------------
+// Tiles: small cards inside a section
+// ---------------------------------------------------------------------------
+
+/// Default narrowest width of a [`tile`] before tiles wrap.
+const TILE_MIN_WIDTH: f32 = 240.;
+
+/// `"House · VA-06"`, `"Senate · OK"`, `"President"`. Only House races have
+/// districts; Senate and presidential filings often carry `00`.
+pub fn office_text(
+    office: Option<&str>,
+    label: Option<&str>,
+    state: Option<&str>,
+    district: Option<&str>,
+) -> Option<String> {
+    let house = office.is_some_and(|o| o.eq_ignore_ascii_case("H"));
+    let mut parts = vec![];
+    if let Some(office) = office {
+        parts.push(label.unwrap_or(office).to_string());
+    }
+    match (state, district) {
+        (Some(state), Some(district)) if house => parts.push(format!("{state}-{district}")),
+        (Some(state), _) => parts.push(state.to_string()),
+        _ => {}
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// `(405) 826-6448` for ten-digit numbers, otherwise as filed.
+pub fn format_phone(phone: &str) -> String {
+    let phone = phone.trim();
+    if phone.len() == 10 && phone.bytes().all(|b| b.is_ascii_digit()) {
+        format!("({}) {}-{}", &phone[0..3], &phone[3..6], &phone[6..])
+    } else {
+        phone.to_string()
+    }
+}
+
+/// An address as street and city/state/ZIP lines, for a [`tile`].
+pub fn address_lines(address: &Address) -> Vec<AnyElement> {
+    let street = [address.street_1.as_deref(), address.street_2.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let city_state = [address.city.as_deref(), address.state.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let last = match address.zip_code.as_deref().map(format_zip) {
+        Some(zip) if !city_state.is_empty() => format!("{city_state} {zip}"),
+        Some(zip) => zip,
+        None => city_state,
+    };
+    [street, last]
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .map(|line| div().child(line).into_any_element())
+        .collect()
+}
+
+/// Muted text.
+pub fn muted(text: impl Into<SharedString>, cx: &App) -> AnyElement {
+    div()
+        .text_color(cx.theme().muted_foreground)
+        .child(text.into())
+        .into_any_element()
+}
+
+/// An element in bold.
+pub fn strong_element(child: AnyElement) -> AnyElement {
+    div()
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(child)
+        .into_any_element()
+}
+
+/// A small bordered card inside a section: a muted caption with optional tags,
+/// then its lines. `emphasis` gives it the accent border (e.g. the treasurer).
+pub fn tile(
+    caption: &str,
+    tags: Vec<AnyElement>,
+    body: Vec<AnyElement>,
+    emphasis: bool,
+    cx: &App,
+) -> AnyElement {
+    tile_sized(TILE_MIN_WIDTH, caption, tags, body, emphasis, cx)
+}
+
+/// A [`tile`] that wraps below `min_width` instead of the default.
+pub fn tile_sized(
+    min_width: f32,
+    caption: &str,
+    tags: Vec<AnyElement>,
+    body: Vec<AnyElement>,
+    emphasis: bool,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme();
+    v_flex()
+        .flex_1()
+        .min_w(px(min_width))
+        .px_3()
+        .py_2()
+        .gap_0p5()
+        .rounded(theme.radius_lg)
+        .border_1()
+        .border_color(if emphasis {
+            theme.primary.opacity(0.6)
+        } else {
+            theme.border
         })
-        .render(cx)
+        .when(emphasis, |d| d.bg(theme.primary.opacity(0.04)))
+        .child(
+            h_flex()
+                .gap_2()
+                .flex_wrap()
+                .items_center()
+                .pb_0p5()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.muted_foreground)
+                        .child(caption.to_uppercase()),
+                )
+                .children(tags),
+        )
+        .children(body)
+        .into_any_element()
+}
+
+/// A row of [`tile`]s that wraps on narrow windows.
+pub fn tiles(children: Vec<AnyElement>) -> AnyElement {
+    h_flex()
+        .w_full()
+        .gap_3()
+        .flex_wrap()
+        .items_stretch()
+        .children(children)
+        .into_any_element()
 }
 
 #[cfg(test)]
 mod tests {
     // Not `super::*`: that brings in gpui's `test` attribute.
-    use super::{election_text, format_usd, format_zip};
+    use super::{election_text, format_phone, format_usd, format_zip, office_text, seat_text};
+
+    #[test]
+    fn formats_seats_and_offices() {
+        assert_eq!(seat_text(Some("CA"), Some("32")).as_deref(), Some("CA-32"));
+        assert_eq!(seat_text(Some("TX"), Some("00")).as_deref(), Some("TX"));
+        assert_eq!(seat_text(Some("TX"), None).as_deref(), Some("TX"));
+        assert_eq!(seat_text(None, None), None);
+        assert_eq!(
+            office_text(Some("H"), Some("House"), Some("VA"), Some("06")).as_deref(),
+            Some("House · VA-06")
+        );
+        assert_eq!(
+            office_text(Some("S"), Some("Senate"), Some("OK"), Some("00")).as_deref(),
+            Some("Senate · OK")
+        );
+        assert_eq!(office_text(None, None, None, None), None);
+    }
+
+    #[test]
+    fn formats_phones() {
+        assert_eq!(format_phone("4058266448"), "(405) 826-6448");
+        assert_eq!(format_phone("x123"), "x123");
+    }
 
     #[test]
     fn formats_zips() {

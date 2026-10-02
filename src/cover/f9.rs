@@ -26,11 +26,7 @@ pub fn render(f: &Form9, cx: &App) -> Vec<AnyElement> {
         stats(
             vec![
                 Stat::new("10. Total donations", f.total_donations),
-                Stat::new(
-                    "11. Total disbursements/obligations",
-                    f.total_disbursements,
-                )
-                .emphasis(),
+                Stat::new("11. Total disbursements/obligations", f.total_disbursements).emphasis(),
             ],
             cx,
         ),
@@ -54,7 +50,9 @@ fn communication(f: &Form9, cx: &App) -> AnyElement {
             "Segregated account",
             f.segregated_bank_account.as_deref().map(|code| {
                 match f.used_segregated_bank_account() {
-                    Some(true) => "Yes — paid only from donations to a segregated bank account".into(),
+                    Some(true) => {
+                        "Yes — paid only from donations to a segregated bank account".into()
+                    }
                     Some(false) => "No".into(),
                     None => yes_no_code(code),
                 }
@@ -62,7 +60,12 @@ fn communication(f: &Form9, cx: &App) -> AnyElement {
         )
         .person("Completed by", &f.person_completing)
         .date("Date signed", f.date_signed);
-    section_with("Communication", Some("Lines 4–6, 8"), vec![fields.render(cx)], cx)
+    section_with(
+        "Communication",
+        Some("Lines 4–6, 8"),
+        vec![fields.render(cx)],
+        cx,
+    )
 }
 
 /// Lines 1–3 and 7: who made the disbursements.
@@ -103,28 +106,4 @@ fn custodian(f: &Form9, cx: &App) -> AnyElement {
         vec![fields.render(cx)]
     };
     section_with("Custodian of Records", Some("Line 9"), children, cx)
-}
-
-/// The electronic-format `entity_type` code as `"Organization (ORG)"`.
-// Hoisting candidate: Form 5 has the same helper.
-fn entity_label(code: &str) -> String {
-    let label = match code.trim().to_ascii_uppercase().as_str() {
-        "IND" => Some("Individual"),
-        "ORG" => Some("Organization"),
-        "COM" => Some("Committee"),
-        "PAC" => Some("PAC"),
-        "PTY" => Some("Party organization"),
-        _ => None,
-    };
-    code_with_label(code.trim(), label)
-}
-
-/// A `Y` / `N` column as `"Yes"` / `"No"`, or the raw value otherwise.
-// Hoisting candidate: Form 5 has the same helper.
-fn yes_no_code(code: &str) -> String {
-    match code.trim() {
-        "Y" | "y" => "Yes".into(),
-        "N" | "n" => "No".into(),
-        other => other.into(),
-    }
 }

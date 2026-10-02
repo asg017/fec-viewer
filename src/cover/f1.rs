@@ -4,14 +4,12 @@
 //! affiliate (Line 6), the people responsible for it (Lines 7–8) and its banks
 //! (Line 9). People, affiliates and banks are laid out as side-by-side tiles.
 
-use fec_parser::covers::{Address, Form1, Form1Affiliated, Form1Bank, Form1Contact};
-use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
-use gpui_kit::{prelude::FluentBuilder as _, *};
+use fec_parser::covers::{Form1, Form1Affiliated, Form1Bank, Form1Contact};
+use gpui_kit::*;
 
 use super::layout::*;
 
 /// Narrowest a [`tiles`] tile gets before the row wraps.
-const TILE_MIN_WIDTH: f32 = 240.;
 
 pub fn render(f: &Form1, cx: &App) -> Vec<AnyElement> {
     let mut sections = vec![
@@ -88,12 +86,7 @@ fn committee(f: &Form1, cx: &App) -> AnyElement {
     let mut fields = Fields::new()
         .element("Name", name)
         .text("FEC ID", f.filer_committee_id.clone())
-        .address(
-            "Mailing address",
-            &with_zip(&f.address),
-            f.change_of_address,
-            cx,
-        );
+        .address("Mailing address", &f.address, f.change_of_address, cx);
     if let Some(email) = &f.committee_email {
         // Up to two addresses, separated by a semicolon or a comma.
         let emails = email
@@ -509,185 +502,4 @@ fn is_placeholder(a: &Form1Affiliated) -> bool {
 /// Same name and address (titles differ: "Treasurer" vs "Custodian").
 fn same_person(a: &Form1Contact, b: &Form1Contact) -> bool {
     a.name == b.name && a.address == b.address
-}
-
-/// `"House · VA-06"`, `"Senate · OK"`, `"President"`. Only House races have
-/// districts; Senate and presidential filings often carry `00`.
-pub(super) fn office_text(
-    office: Option<&str>,
-    label: Option<&str>,
-    state: Option<&str>,
-    district: Option<&str>,
-) -> Option<String> {
-    let house = office.is_some_and(|o| o.eq_ignore_ascii_case("H"));
-    let mut parts = vec![];
-    if let Some(office) = office {
-        parts.push(label.unwrap_or(office).to_string());
-    }
-    match (state, district) {
-        (Some(state), Some(district)) if house => parts.push(format!("{state}-{district}")),
-        (Some(state), _) => parts.push(state.to_string()),
-        _ => {}
-    }
-    (!parts.is_empty()).then(|| parts.join(" · "))
-}
-
-/// `(405) 826-6448` for ten-digit numbers, otherwise as filed.
-fn format_phone(phone: &str) -> String {
-    let phone = phone.trim();
-    if phone.len() == 10 && phone.bytes().all(|b| b.is_ascii_digit()) {
-        format!("({}) {}-{}", &phone[0..3], &phone[3..6], &phone[6..])
-    } else {
-        phone.to_string()
-    }
-}
-
-/// `730081639` → `73008-1639`; other ZIP codes as filed.
-fn format_zip(zip: &str) -> String {
-    if zip.len() == 9 && zip.bytes().all(|b| b.is_ascii_digit()) {
-        format!("{}-{}", &zip[..5], &zip[5..])
-    } else {
-        zip.to_string()
-    }
-}
-
-/// The address with its ZIP+4 hyphenated, for [`Fields::address`].
-pub(super) fn with_zip(address: &Address) -> Address {
-    Address {
-        zip_code: address.zip_code.as_deref().map(format_zip),
-        ..address.clone()
-    }
-}
-
-/// An address as street and city/state/ZIP lines, for a [`tile`].
-fn address_lines(address: &Address) -> Vec<AnyElement> {
-    let street = [address.street_1.as_deref(), address.street_2.as_deref()]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(", ");
-    let city_state = [address.city.as_deref(), address.state.as_deref()]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(", ");
-    let last = match address.zip_code.as_deref().map(format_zip) {
-        Some(zip) if !city_state.is_empty() => format!("{city_state} {zip}"),
-        Some(zip) => zip,
-        None => city_state,
-    };
-    [street, last]
-        .into_iter()
-        .filter(|line| !line.is_empty())
-        .map(|line| div().child(line).into_any_element())
-        .collect()
-}
-
-/// Muted text.
-pub(super) fn muted(text: impl Into<SharedString>, cx: &App) -> AnyElement {
-    div()
-        .text_color(cx.theme().muted_foreground)
-        .child(text.into())
-        .into_any_element()
-}
-
-/// An element in bold.
-pub(super) fn strong_element(child: AnyElement) -> AnyElement {
-    div()
-        .font_weight(FontWeight::SEMIBOLD)
-        .child(child)
-        .into_any_element()
-}
-
-/// A small bordered card inside a section: a muted caption with optional tags,
-/// then its lines. `emphasis` gives it the accent border (e.g. the treasurer).
-pub(super) fn tile(
-    caption: &str,
-    tags: Vec<AnyElement>,
-    body: Vec<AnyElement>,
-    emphasis: bool,
-    cx: &App,
-) -> AnyElement {
-    tile_sized(TILE_MIN_WIDTH, caption, tags, body, emphasis, cx)
-}
-
-/// A [`tile`] that wraps below `min_width` instead of the default.
-pub(super) fn tile_sized(
-    min_width: f32,
-    caption: &str,
-    tags: Vec<AnyElement>,
-    body: Vec<AnyElement>,
-    emphasis: bool,
-    cx: &App,
-) -> AnyElement {
-    let theme = cx.theme();
-    v_flex()
-        .flex_1()
-        .min_w(px(min_width))
-        .px_3()
-        .py_2()
-        .gap_0p5()
-        .rounded(theme.radius_lg)
-        .border_1()
-        .border_color(if emphasis {
-            theme.primary.opacity(0.6)
-        } else {
-            theme.border
-        })
-        .when(emphasis, |d| d.bg(theme.primary.opacity(0.04)))
-        .child(
-            h_flex()
-                .gap_2()
-                .flex_wrap()
-                .items_center()
-                .pb_0p5()
-                .child(
-                    div()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.muted_foreground)
-                        .child(caption.to_uppercase()),
-                )
-                .children(tags),
-        )
-        .children(body)
-        .into_any_element()
-}
-
-/// A row of [`tile`]s that wraps on narrow windows.
-pub(super) fn tiles(children: Vec<AnyElement>) -> AnyElement {
-    h_flex()
-        .w_full()
-        .gap_3()
-        .flex_wrap()
-        .items_stretch()
-        .children(children)
-        .into_any_element()
-}
-
-#[cfg(test)]
-mod tests {
-    // Not `super::*`: that brings in gpui's `test` attribute.
-    use super::{format_phone, format_zip, office_text};
-
-    #[test]
-    fn formats_contact_details() {
-        assert_eq!(format_phone("4058266448"), "(405) 826-6448");
-        assert_eq!(format_phone("x123"), "x123");
-        assert_eq!(format_zip("730081639"), "73008-1639");
-        assert_eq!(format_zip("20005"), "20005");
-    }
-
-    #[test]
-    fn formats_offices() {
-        assert_eq!(
-            office_text(Some("H"), Some("House"), Some("VA"), Some("06")).as_deref(),
-            Some("House · VA-06")
-        );
-        assert_eq!(
-            office_text(Some("S"), Some("Senate"), Some("OK"), Some("00")).as_deref(),
-            Some("Senate · OK")
-        );
-        assert_eq!(office_text(None, None, None, None), None);
-    }
 }

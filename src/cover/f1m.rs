@@ -10,7 +10,6 @@ use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::{prelude::FluentBuilder as _, *};
 use jiff::ToSpan as _;
 
-use super::f1::{muted, office_text, strong_element, tile, tile_sized, tiles, with_zip};
 use super::layout::*;
 
 /// Row numbers of the Line 5(a) candidate table.
@@ -95,7 +94,7 @@ fn committee(f: &Form1M, cx: &App) -> AnyElement {
     let fields = Fields::new()
         .text("Name", f.committee_name.clone())
         .text("FEC ID", f.filer_committee_id.clone())
-        .address("Mailing address", &with_zip(&f.address), false, cx)
+        .address("Mailing address", &f.address, false, cx)
         .opt(
             "Type",
             f.committee_type

@@ -45,8 +45,8 @@ fn bundled(f: &Form3L, cx: &App) -> AnyElement {
         a = a.detail(period, Tone::Neutral);
     }
     let mut tiles = vec![a];
-    let semi_annual = f.covers_semi_annual_period()
-        || f.line7b_semi_annual_bundled_contributions.is_some();
+    let semi_annual =
+        f.covers_semi_annual_period() || f.line7b_semi_annual_bundled_contributions.is_some();
     if semi_annual {
         let mut b = Stat::new(
             "7(b) Semi-annual period",
@@ -79,10 +79,13 @@ fn bundled(f: &Form3L, cx: &App) -> AnyElement {
 /// Lines 1–6: committee, candidate's race, report type, covered periods.
 fn identification(f: &Form3L, cx: &App) -> AnyElement {
     // Line 4: House and Senate candidates' committees only.
-    let race = f.election_state.as_deref().map(|state| match f.election_district.as_deref() {
-        Some(district) => format!("{state}, district {district}"),
-        None => state.to_string(),
-    });
+    let race = f
+        .election_state
+        .as_deref()
+        .map(|state| match f.election_district.as_deref() {
+            Some(district) => format!("{state}, district {district}"),
+            None => state.to_string(),
+        });
     let fields = Fields::new()
         .element(
             "Committee",
@@ -99,7 +102,12 @@ fn identification(f: &Form3L, cx: &App) -> AnyElement {
         // Line 5(c)/(d): the election a pre-/post-election report is for.
         .opt(
             "Election",
-            election_text(None, None, f.election_date, f.election_held_in_state.as_deref()),
+            election_text(
+                None,
+                None,
+                f.election_date,
+                f.election_held_in_state.as_deref(),
+            ),
         )
         .opt(
             "Covered period",
