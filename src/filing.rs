@@ -28,7 +28,7 @@ use std::time::Instant;
 use web_time::Instant;
 
 use anyhow::Context as _;
-use fec_parser::{Filing, report_code_label};
+use fec_parser::{Filing, covers::Cover, report_code_label};
 
 /// Rows per collected chunk. Chunks are published whole, so row `i` always
 /// lives in chunk `i / CHUNK_ROWS`.
@@ -44,12 +44,44 @@ pub struct FilingSummary {
     pub filer_name: String,
     pub filer_id: String,
     pub form_type: String,
+    /// The form-specific report type for 24/48-hour notices (F24, F5), else
+    /// the report code's label.
     pub report_label: Option<&'static str>,
     pub coverage_from: Option<String>,
     pub coverage_through: Option<String>,
     pub fec_version: String,
     pub software: String,
+    pub report_id: Option<String>,
+    pub report_number: Option<String>,
+    pub comment: Option<String>,
     pub cover_kv: Vec<(String, String)>,
+    /// The typed cover, when `fec_parser` understands the form.
+    pub cover: Option<Cover>,
+}
+
+impl FilingSummary {
+    /// The filing's page on docquery.fec.gov, for filings with a numeric ID.
+    pub fn fec_url(&self) -> Option<String> {
+        let numeric = !self.filing_id.is_empty() && self.filing_id.bytes().all(|b| b.is_ascii_digit());
+        (numeric && !self.filer_id.is_empty()).then(|| {
+            format!(
+                "https://docquery.fec.gov/cgi-bin/forms/{}/{}",
+                self.filer_id, self.filing_id
+            )
+        })
+    }
+}
+
+fn report_label(cover: Option<&Cover>, report_code: Option<&str>) -> Option<&'static str> {
+    let form_specific = match cover {
+        Some(Cover::Form24(f)) => f.report_type_label(),
+        Some(Cover::Form5(f)) => f.report_type_label(),
+        _ => None,
+    };
+    form_specific.or_else(|| match report_code_label(report_code?) {
+        "[Unknown report code]" => None,
+        label => Some(label),
+    })
 }
 
 #[derive(Default)]
@@ -181,7 +213,7 @@ fn summarize<R: Read>(filing: Filing<R>) -> (FilingSummary, u64) {
         filer_name: cover.filer_name.clone(),
         filer_id: cover.filer_id.clone(),
         form_type: cover.form_type.clone(),
-        report_label: cover.report_code.as_deref().map(report_code_label),
+        report_label: report_label(cover.cover_data.as_ref(), cover.report_code.as_deref()),
         coverage_from: cover.coverage_from_date.map(|d| d.to_string()),
         coverage_through: cover.coverage_through_date.map(|d| d.to_string()),
         fec_version: filing.header.fec_version.clone(),
@@ -189,11 +221,15 @@ fn summarize<R: Read>(filing: Filing<R>) -> (FilingSummary, u64) {
             "{} {}",
             filing.header.software_name, filing.header.software_version
         ),
+        report_id: filing.header.report_id.clone(),
+        report_number: filing.header.report_number.clone(),
+        comment: filing.header.comment.clone(),
         cover_kv: cover
             .cover_record_kv
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
+        cover: cover.cover_data.clone(),
     };
     (summary, filing.source_length as u64)
 }

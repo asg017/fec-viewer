@@ -5,9 +5,10 @@ edition = "2024"
 publish = false
 
 [dependencies]
-fec-parser = { git = "https://github.com/asg017/libfec", rev = "a1660e5782f62ed285ba5880070a6ae82a626c4e" }  # branch fec-parser-byte-offset
+fec-parser = { path = "/Users/alex/projects/libfec-wt/typed-covers/crates/fec-parser" }  # TEMP: switch to git branch typed-covers once pushed
 gpui-kit = "0.7.0"
 anyhow = "1"
+jiff = "0.2"
 csv = "1.2.2"
 futures = "0.3"
 
