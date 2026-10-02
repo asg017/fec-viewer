@@ -757,7 +757,8 @@ pub fn amounts_table(rows: &[(&str, f64)], cx: &App) -> AnyElement {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // Not `super::*`: that brings in gpui's `test` attribute.
+    use super::{election_text, format_usd};
 
     #[test]
     fn formats_money() {
