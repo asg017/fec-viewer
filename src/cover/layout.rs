@@ -51,6 +51,16 @@ fn group_thousands(n: u64) -> String {
     out
 }
 
+/// A ZIP code, with ZIP+4 hyphenated: `"940253656"` → `"94025-3656"`.
+pub fn format_zip(zip: &str) -> String {
+    let zip = zip.trim();
+    if zip.len() == 9 && zip.bytes().all(|b| b.is_ascii_digit()) {
+        format!("{}-{}", &zip[..5], &zip[5..])
+    } else {
+        zip.to_owned()
+    }
+}
+
 /// `"Label (CODE)"`, or just the code when no label is sourced.
 pub fn code_with_label(code: &str, label: Option<&str>) -> String {
     match label {
@@ -295,14 +305,15 @@ pub fn note(text: impl Into<SharedString>, cx: &App) -> AnyElement {
 /// breaks kept.
 pub fn prose(text: &str, cx: &App) -> AnyElement {
     let theme = cx.theme();
+    // No gap between lines, so a letter's own line breaks are spaced the
+    // same as a long line's wrapping.
     v_flex()
-        .gap_1()
         .font_family(theme.mono_font_family.clone())
         .text_size(theme.mono_font_size)
         .children(text.lines().map(|line| {
-            // An empty div collapses; keep blank lines as visible gaps.
+            // An empty div collapses; keep blank lines one line tall.
             if line.trim().is_empty() {
-                div().h_2().into_any_element()
+                div().child(" ").into_any_element()
             } else {
                 div().child(line.to_string()).into_any_element()
             }
@@ -403,9 +414,9 @@ impl Fields {
             .flatten()
             .collect::<Vec<_>>()
             .join(", ");
-        let city_state_zip = match address.zip_code.as_deref() {
+        let city_state_zip = match address.zip_code.as_deref().map(format_zip) {
             Some(zip) if !city_state.is_empty() => format!("{city_state} {zip}"),
-            Some(zip) => zip.to_owned(),
+            Some(zip) => zip,
             None => city_state,
         };
         let value = v_flex()
@@ -576,7 +587,13 @@ pub fn cash_flow(begin: f64, receipts: f64, disbursements: f64, end: f64, cx: &A
         let sign = if change_cents > 0.0 { "+" } else { "" };
         let mut text = format!("{sign}{}", format_usd(end - begin));
         if begin > 0.0 {
-            text.push_str(&format!(" ({sign}{:.0}%)", (end - begin) / begin * 100.0));
+            let pct = (end - begin) / begin * 100.0;
+            // A small change rounds to "0%"; say "<1%" rather than "-0%".
+            if pct.abs() < 0.5 {
+                text.push_str(" (<1%)");
+            } else {
+                text.push_str(&format!(" ({sign}{pct:.0}%)"));
+            }
         }
         let tone = if change_cents > 0.0 {
             Tone::Success
@@ -758,7 +775,14 @@ pub fn amounts_table(rows: &[(&str, f64)], cx: &App) -> AnyElement {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: that brings in gpui's `test` attribute.
-    use super::{election_text, format_usd};
+    use super::{election_text, format_usd, format_zip};
+
+    #[test]
+    fn formats_zips() {
+        assert_eq!(format_zip("940253656"), "94025-3656");
+        assert_eq!(format_zip("94025"), "94025");
+        assert_eq!(format_zip("K1A 0B1"), "K1A 0B1");
+    }
 
     #[test]
     fn formats_money() {
