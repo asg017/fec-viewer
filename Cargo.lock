@@ -1784,6 +1784,7 @@ dependencies = [
 [[package]]
 name = "fec-parser"
 version = "0.1.0"
+source = "git+https://github.com/asg017/libfec?branch=typed-covers#b1abe2e32ac7b3563200335302ddf723173f22b0"
 dependencies = [
  "anyhow",
  "bstr",
@@ -1801,6 +1802,7 @@ dependencies = [
 [[package]]
 name = "fec-parser-macros"
 version = "0.1.0"
+source = "git+https://github.com/asg017/libfec?branch=typed-covers#b1abe2e32ac7b3563200335302ddf723173f22b0"
 dependencies = [
  "proc-macro2",
  "quote",

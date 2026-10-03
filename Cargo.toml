@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-fec-parser = { path = "/Users/alex/projects/libfec-wt/typed-covers/crates/fec-parser" }  # TEMP: switch to git branch typed-covers once pushed
+fec-parser = { git = "https://github.com/asg017/libfec", branch = "typed-covers" }
 gpui-kit = "0.7.0"
 anyhow = "1"
 jiff = "0.2"

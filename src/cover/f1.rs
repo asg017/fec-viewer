@@ -9,8 +9,6 @@ use gpui_kit::*;
 
 use super::layout::*;
 
-/// Narrowest a [`tiles`] tile gets before the row wraps.
-
 pub fn render(f: &Form1, cx: &App) -> Vec<AnyElement> {
     let mut sections = vec![
         banner(
