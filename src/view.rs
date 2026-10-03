@@ -6,12 +6,15 @@ use std::{
 
 use fec_parser::mappings::column_names_for_field;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, h_flex,
+    ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _,
+    button::{Button, ButtonGroup},
+    h_flex,
     table::{Column, DataTable, TableDelegate, TableEvent, TableState},
     v_flex,
 };
 use gpui_kit::{prelude::FluentBuilder as _, *};
 
+use crate::cover;
 use crate::filing::{CollectState, Collection, Matcher, OpenFiling, Schedule, Source};
 
 /// Cap on cached parsed rows; plenty for a screenful plus scroll-back.
@@ -158,6 +161,8 @@ pub struct FilingView {
     selection: Selection,
     collection: Option<Collection>,
     collapsed: HashSet<Schedule>,
+    /// Show the cover's raw fields instead of its form layout.
+    cover_raw: bool,
     selected_row: Option<usize>,
     table: Entity<TableState<RowsDelegate>>,
     _poll: Option<Task<()>>,
@@ -186,6 +191,7 @@ impl FilingView {
             selection: Selection::Cover,
             collection: None,
             collapsed: HashSet::new(),
+            cover_raw: false,
             selected_row: None,
             table,
             _poll: None,
@@ -579,14 +585,7 @@ impl FilingView {
 
     fn render_main(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match self.selection {
-            Selection::Cover => {
-                let kv = self
-                    .filing
-                    .as_ref()
-                    .map(|f| f.summary.cover_kv.clone())
-                    .unwrap_or_default();
-                render_kv("cover-kv", kv, cx).into_any_element()
-            }
+            Selection::Cover => self.render_cover(cx),
             Selection::Records(_) => h_flex()
                 .size_full()
                 .child(
@@ -615,6 +614,55 @@ impl FilingView {
                 .into_any_element(),
         };
         div().flex_1().min_w_0().h_full().child(content)
+    }
+
+    /// The typed cover laid out for its form, or the raw cover fields for
+    /// forms without one (and on request).
+    fn render_cover(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(filing) = &self.filing else {
+            return div().into_any_element();
+        };
+        let s = &filing.summary;
+        let raw = self.cover_raw || s.cover.is_none();
+        let body = if raw {
+            render_kv("cover-kv", s.cover_kv.clone(), cx).into_any_element()
+        } else {
+            let mut children = s
+                .cover
+                .as_ref()
+                .map(|c| cover::render(c, cx))
+                .unwrap_or_default();
+            children.push(cover::filing_section(s, cx));
+            cover::layout::page("cover-page", children).into_any_element()
+        };
+        let toggle = s.cover.is_some().then(|| {
+            ButtonGroup::new("cover-mode")
+                .small()
+                .outline()
+                .child(
+                    Button::new("cover-formatted")
+                        .label("Formatted")
+                        .selected(!raw),
+                )
+                .child(Button::new("cover-raw").label("Raw fields").selected(raw))
+                .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
+                    this.cover_raw = selected.first() == Some(&1);
+                    cx.notify();
+                }))
+        });
+        v_flex()
+            .size_full()
+            .children(toggle.map(|t| {
+                h_flex()
+                    .px_3()
+                    .py_2()
+                    .justify_end()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(t)
+            }))
+            .child(div().flex_1().min_h_0().child(body))
+            .into_any_element()
     }
 
     fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement {

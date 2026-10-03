@@ -1784,7 +1784,7 @@ dependencies = [
 [[package]]
 name = "fec-parser"
 version = "0.1.0"
-source = "git+https://github.com/asg017/libfec?rev=a1660e5782f62ed285ba5880070a6ae82a626c4e#a1660e5782f62ed285ba5880070a6ae82a626c4e"
+source = "git+https://github.com/asg017/libfec?branch=typed-covers#b1abe2e32ac7b3563200335302ddf723173f22b0"
 dependencies = [
  "anyhow",
  "bstr",
@@ -1794,6 +1794,7 @@ dependencies = [
  "jiff",
  "lazy_static",
  "regex",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
 ]
@@ -1801,7 +1802,7 @@ dependencies = [
 [[package]]
 name = "fec-parser-macros"
 version = "0.1.0"
-source = "git+https://github.com/asg017/libfec?rev=a1660e5782f62ed285ba5880070a6ae82a626c4e#a1660e5782f62ed285ba5880070a6ae82a626c4e"
+source = "git+https://github.com/asg017/libfec?branch=typed-covers#b1abe2e32ac7b3563200335302ddf723173f22b0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1818,6 +1819,7 @@ dependencies = [
  "fec-parser",
  "futures",
  "gpui-kit",
+ "jiff",
  "js-sys",
  "objc2 0.6.4",
  "raw-window-handle",
