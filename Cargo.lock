@@ -1784,11 +1784,12 @@ dependencies = [
 [[package]]
 name = "fec-parser"
 version = "0.1.0"
-source = "git+https://github.com/asg017/libfec?branch=typed-covers#b1abe2e32ac7b3563200335302ddf723173f22b0"
+source = "git+https://github.com/asg017/libfec?branch=main#7dc5fd6b6eb070ef4961094ffebbdaa2d125e830"
 dependencies = [
  "anyhow",
  "bstr",
  "csv",
+ "csv-core",
  "fec-parser-macros",
  "indexmap",
  "jiff",
@@ -1802,7 +1803,7 @@ dependencies = [
 [[package]]
 name = "fec-parser-macros"
 version = "0.1.0"
-source = "git+https://github.com/asg017/libfec?branch=typed-covers#b1abe2e32ac7b3563200335302ddf723173f22b0"
+source = "git+https://github.com/asg017/libfec?branch=main#7dc5fd6b6eb070ef4961094ffebbdaa2d125e830"
 dependencies = [
  "proc-macro2",
  "quote",
