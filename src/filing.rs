@@ -28,7 +28,9 @@ use std::time::Instant;
 use web_time::Instant;
 
 use anyhow::Context as _;
-use fec_parser::{Filing, covers::Cover, report_code_label};
+use fec_parser::{Delimiter, Filing, HeaderStyle, covers::Cover, report_code_label};
+
+use crate::debug::index::{is_begin_text, is_end_text, sniff};
 
 /// Rows per collected chunk. Chunks are published whole, so row `i` always
 /// lives in chunk `i / CHUNK_ROWS`.
@@ -319,17 +321,41 @@ const SCAN_STEP: usize = 4096;
 
 /// Reads the records after the header and cover, skipping `[BEGINTEXT]` …
 /// `[ENDTEXT]` blocks the way `fec_parser` does.
+///
+/// The delimiter and header style are sniffed with `fec_parser`'s rules:
+/// 0x1C for 6.x and later, commas (with quoting) for v1–5.x, whose header
+/// is either an `HDR` record or a `/* Header` … `/*` block.
 struct Scanner {
     rdr: csv::Reader<Box<dyn Read + Send>>,
     record: csv::ByteRecord,
-    seen: usize,
+    preamble: Preamble,
     in_text: bool,
 }
 
+/// What's left to skip before the body.
+enum Preamble {
+    /// A `/* Header` block (until its closing `/*` line), then the cover.
+    Block {
+        opened: bool,
+    },
+    /// This many records (the `HDR` record and the cover).
+    Records(usize),
+    Done,
+}
+
+/// Bytes read to sniff the format; the first line must fit (as in `fec_parser`).
+const SNIFF_BYTES: u64 = 1 << 20;
+
 impl Scanner {
     fn new(source: &Source) -> anyhow::Result<Self> {
+        let mut head = Vec::new();
+        source.reader()?.take(SNIFF_BYTES).read_to_end(&mut head)?;
+        let facts = sniff(&head);
         let rdr = csv::ReaderBuilder::new()
-            .delimiter(0x1c)
+            .delimiter(match facts.delimiter {
+                Delimiter::Fs => 0x1c,
+                Delimiter::Comma => b',',
+            })
             .flexible(true)
             .has_headers(false)
             .buffer_capacity(READ_BUFFER)
@@ -337,7 +363,10 @@ impl Scanner {
         Ok(Self {
             rdr,
             record: csv::ByteRecord::new(),
-            seen: 0,
+            preamble: match facts.style {
+                HeaderStyle::LegacyBlock => Preamble::Block { opened: false },
+                _ => Preamble::Records(2),
+            },
             in_text: false,
         })
     }
@@ -349,16 +378,35 @@ impl Scanner {
             if !self.rdr.read_byte_record(&mut self.record)? {
                 return Ok(false);
             }
-            self.seen += 1;
-            if self.seen <= 2 {
-                continue; // HDR + cover
-            }
             let first = self.record.get(0).unwrap_or_default();
+            match &mut self.preamble {
+                Preamble::Done => {}
+                Preamble::Block { opened } => {
+                    if first.trim_ascii_start().starts_with(b"/*") {
+                        if *opened {
+                            self.preamble = Preamble::Records(1); // the cover
+                        } else {
+                            *opened = true;
+                        }
+                    }
+                    continue;
+                }
+                Preamble::Records(n) => {
+                    if self.record.iter().all(|f| f.trim_ascii().is_empty()) {
+                        continue; // blank lines before the cover
+                    }
+                    *n -= 1;
+                    if *n == 0 {
+                        self.preamble = Preamble::Done;
+                    }
+                    continue;
+                }
+            }
             if self.in_text {
-                self.in_text = first != b"[ENDTEXT]";
+                self.in_text = !is_end_text(first);
                 continue;
             }
-            if first == b"[BEGINTEXT]" {
+            if is_begin_text(first) {
                 self.in_text = true;
                 continue;
             }
@@ -837,6 +885,27 @@ mod tests {
 
         let b = collect(file.path(), Matcher::RowType("SB23".into()));
         assert_eq!(b.row(0), ["SB23", "C00000001", "two\nlines"]);
+    }
+
+    /// v1–5.x filings: comma-delimited, with an `HDR` record or a
+    /// `/* Header` block, and text markers in any case.
+    #[test]
+    fn reads_legacy_comma_filings() {
+        let block = tempfile_path::TempPath::with_contents(
+            "/* Header\nFEC_Ver_# = 2.02\nSA16 = 00001\n/* End Header\nF3PN,C001,\"Smith, Jo\"\n\
+             SA16,C001,\"A, B\"\n[BEGIN TEXT]\nSA16,prose\n[EndText]\nSB23,C001,x\n",
+        );
+        let c = count(block.path());
+        assert!(c.done && c.error.is_none(), "{:?}", c.error);
+        assert_eq!(c.types, [("SA16".into(), 1), ("SB23".into(), 1)]);
+        let s = collect(block.path(), Matcher::RowType("SA16".into()));
+        assert_eq!(s.row(0), ["SA16", "C001", "A, B"]);
+
+        let hdr = tempfile_path::TempPath::with_contents(
+            "\"HDR\",\"FEC\",\"5.00\",\"X\",\"1\"\n\n\"F3XN\",\"C001\"\n\"SA11A1\",\"C001\",\"x\"\n",
+        );
+        let c = count(hdr.path());
+        assert_eq!(c.types, [("SA11A1".to_owned(), 1)]);
     }
 
     #[test]
