@@ -609,7 +609,7 @@ impl FilingView {
                         1,
                         is_selected(&matcher),
                     )
-                    .font_family("monospace")
+                    .font_family(theme.mono_font_family.clone())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select(Selection::Records(matcher.clone()), cx)
                     })),
@@ -627,7 +627,7 @@ impl FilingView {
                     0,
                     is_selected(&matcher),
                 )
-                .font_family("monospace")
+                .font_family(theme.mono_font_family.clone())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.select(Selection::Records(matcher.clone()), cx)
                 })),
