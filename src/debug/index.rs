@@ -764,7 +764,13 @@ impl Indexer {
         let facts = self.facts.clone().expect("sniffed before the first line");
         let delimiter = facts.delimiter;
         let ix = self.lines;
-        let blank = content.trim_ascii().is_empty();
+        // The 0x1C reader skips only empty lines in the body: a line of
+        // spaces is a record (with an empty row type) to `fec_parser`.
+        let blank = if delimiter == Delimiter::Fs && self.phase == Phase::Body {
+            content.is_empty()
+        } else {
+            content.trim_ascii().is_empty()
+        };
 
         let kind = if let Some(_begin) = self.in_text {
             if !blank && is_end_text(first_field(content, delimiter)) {
@@ -1093,6 +1099,36 @@ pub fn find(bytes: &[u8], needle: &[u8], from: u64) -> Option<u64> {
         })
 }
 
+/// The last occurrence of `needle` starting before `before`, wrapping to the
+/// end; [`find`]'s case rule.
+pub fn rfind(bytes: &[u8], needle: &[u8], before: u64) -> Option<u64> {
+    if needle.is_empty() || needle.len() > bytes.len() {
+        return None;
+    }
+    let smart_case =
+        !needle.iter().any(u8::is_ascii_uppercase) && needle.iter().any(u8::is_ascii_alphabetic);
+    let search = |hay: &[u8]| -> Option<usize> {
+        if !smart_case {
+            return memchr::memmem::rfind(hay, needle);
+        }
+        let (lo, up) = (
+            needle[0].to_ascii_lowercase(),
+            needle[0].to_ascii_uppercase(),
+        );
+        memchr::memrchr2_iter(lo, up, hay).find(|&i| {
+            hay.get(i..i + needle.len())
+                .is_some_and(|w| w.eq_ignore_ascii_case(needle))
+        })
+    };
+    // A match starting before `before` ends by `before + len - 1`.
+    let end = (before as usize)
+        .saturating_add(needle.len() - 1)
+        .min(bytes.len());
+    search(&bytes[..end])
+        .or_else(|| search(bytes))
+        .map(|i| i as u64)
+}
+
 /// Every occurrence of `needle` in `hay`, with [`find`]'s case rule.
 pub fn find_all(hay: &[u8], needle: &[u8]) -> Vec<Range<usize>> {
     let mut out = Vec::new();
@@ -1172,6 +1208,10 @@ mod tests {
         assert_eq!(s.record_number(8), Some(4));
         assert_eq!(s.record_line(4), Some(8));
         assert_eq!(s.record_line(0), Some(0));
+
+        let ws = index(&fs("HDR|FEC|8.4\nF3XN|C1\n \nSA11AI|C1\n"));
+        assert_eq!(ws.line(2).unwrap().kind, Kind::Record);
+        assert_eq!(ws.record_number(3), Some(3));
 
         let zzz = s.line(7).unwrap();
         assert!(zzz.flags.contains(Flags::UNMAPPED));
@@ -1348,6 +1388,10 @@ mod tests {
         assert_eq!(find(hay, b"sa11ai", 5), Some(15));
         assert_eq!(find(hay, b"SA11AI", 5), Some(4)); // case-sensitive, wraps
         assert_eq!(find(hay, b"zzz", 0), None);
+        assert_eq!(rfind(hay, b"sa11ai", 15), Some(4));
+        assert_eq!(rfind(hay, b"sa11ai", 4), Some(15)); // wraps to the end
+        assert_eq!(rfind(hay, b"SA11AI", 20), Some(4));
+        assert_eq!(rfind(b"aaa", b"aa", 2), Some(1));
         assert_eq!(find_all(hay, b"sa11ai"), [4..10, 15..21]);
         let starts: Vec<usize> = find_all(hay, b"SA11AI").iter().map(|r| r.start).collect();
         assert_eq!(starts, [4]);

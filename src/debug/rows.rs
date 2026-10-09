@@ -100,7 +100,10 @@ pub fn draw_line(content: &[u8], eol: Eol, kind: Kind, fields: &[Field]) -> Draw
             (Some(_), Kind::TextBegin | Kind::TextEnd) => Class::RowType,
             _ => Class::Text,
         };
-        let consumed = if field.is_none() {
+        let consumed = if field.is_none() && !matches!(b, 0x1c | b',' | b'=') {
+            // Not in a field and not a delimiter: a blank line's whitespace.
+            draw_byte(&mut out, &content[i..drawn], Class::Muted)
+        } else if field.is_none() {
             out.push(
                 if b == 0x1c {
                     FS_GLYPH
@@ -471,6 +474,13 @@ mod tests {
                 ("\\n", LineEnd)
             ]
         );
+    }
+
+    #[test]
+    fn escapes_blank_lines() {
+        let l = draw(b" \t\x0c", Kind::Blank, Delimiter::Fs, Eol::Lf);
+        assert_eq!(l.text, " \\t\\x0C\\n");
+        assert!(l.fields.is_empty());
     }
 
     #[test]

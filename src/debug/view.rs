@@ -35,11 +35,11 @@ use super::{
     data::Data,
     index::{
         Eol, Field, Flags, IndexState, Indexer, Kind, Line, Quote, Severity, field_value, find,
-        find_all, split,
+        find_all, rfind, split,
     },
     rows::{
-        Class, HEX_WIDTH, Jump, ascii_text, byte_class, draw_line, fmt_count, hex_range, hex_text,
-        json_string, line_digits, offset_digits, parse_jump, read_date,
+        Class, HEX_WIDTH, Jump, MAX_DRAWN, ascii_text, byte_class, draw_line, fmt_count, hex_range,
+        hex_text, json_string, line_digits, offset_digits, parse_jump, read_date,
     },
 };
 use crate::filing::{Schedule, Source, spawn_steps};
@@ -51,6 +51,8 @@ const SCROLLBAR_W: f32 = 12.;
 const STEP_LINES: usize = 4096;
 /// Most scrollbar ticks drawn for warnings.
 const MAX_TICKS: usize = 400;
+/// Most fields listed in the inspector (a broken line can have millions).
+const MAX_FIELD_ROWS: usize = 1000;
 /// Field splits kept for drawing; a screenful is ~60 lines.
 const SPLIT_CACHE_CAP: usize = 1024;
 
@@ -332,7 +334,11 @@ impl DebugView {
     }
 
     fn visible_rows(&self) -> usize {
-        ((self.body.get().size.height.as_f32() / ROW_H).floor() as usize).max(1)
+        let height = self.body.get().size.height.as_f32();
+        if height <= 0. {
+            return 30; // not laid out yet; a typical window's worth
+        }
+        ((height / ROW_H).floor() as usize).max(1)
     }
 
     fn cursor_row(&self) -> usize {
@@ -421,9 +427,9 @@ impl DebugView {
             }
             Mode::Hex => {
                 let b = self.byte as i64 + delta as i64 * HEX_WIDTH as i64;
-                if b >= 0 && (b as u64) < self.data.len() {
-                    self.select_byte(b as u64, Reveal::Nearest, cx);
-                }
+                let last = self.data.len().saturating_sub(1) as i64;
+                // Off either end: settle on the first or last byte.
+                self.select_byte(b.clamp(0, last) as u64, Reveal::Nearest, cx);
             }
         }
     }
@@ -613,7 +619,8 @@ impl DebugView {
                 Jump::Word(w) => s
                     .types
                     .iter()
-                    .position(|t| t.name.eq_ignore_ascii_case(w))
+                    .position(|t| t.name == *w)
+                    .or_else(|| s.types.iter().position(|t| t.name.eq_ignore_ascii_case(w)))
                     .map(|t| t as u16),
                 _ => None,
             };
@@ -680,12 +687,7 @@ impl DebugView {
         let again = self.find.as_deref() == Some(needle.as_slice());
         let from = if again { self.byte + 1 } else { self.byte };
         let hit = if backward {
-            // Search backward by searching the bytes before the cursor.
-            let before = &self.bytes()[..self.byte as usize];
-            let all = find_all(before, &needle);
-            all.last()
-                .map(|r| r.start as u64)
-                .or_else(|| find(self.bytes(), &needle, self.byte))
+            rfind(self.bytes(), &needle, self.byte)
         } else {
             find(self.bytes(), &needle, from)
         };
@@ -693,6 +695,8 @@ impl DebugView {
             Some(at) => {
                 if !backward && at < from {
                     self.notice = Some(("Wrapped around to the start".into(), false));
+                } else if backward && at >= self.byte {
+                    self.notice = Some(("Wrapped around to the end".into(), false));
                 }
                 self.find = Some(needle);
                 self.select_byte(at, Reveal::Center, cx);
@@ -755,8 +759,12 @@ impl DebugView {
 
     fn scroll_to_fraction(&mut self, y: Pixels, cx: &mut Context<Self>) {
         let b = self.body.get();
-        let frac = ((y - b.origin.y).as_f32() / b.size.height.as_f32().max(1.)).clamp(0., 1.);
         let total = self.index.lock().map_or(0, |s| self.rows(&s));
+        let height = b.size.height.as_f32();
+        // Put the thumb's middle under the pointer, as it's drawn.
+        let thumb = thumb_height(total, self.visible_rows(), height);
+        let frac = ((y - b.origin.y).as_f32() - thumb / 2.) / (height - thumb).max(1.);
+        let frac = frac.clamp(0., 1.);
         let max_top = total.saturating_sub(self.visible_rows());
         self.top = (frac as f64 * max_top as f64).round() as usize;
         self.scroll_rem = 0.;
@@ -836,9 +844,13 @@ impl Transparent for Theme {
 impl Render for DebugView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let root = v_flex()
+        // The key context covers the rows, inspector and footer but not the
+        // toolbar, so single-key bindings (x, j, /, space) don't swallow
+        // what's typed into the jump box.
+        let keyed = v_flex()
             .id("debug-view")
-            .size_full()
+            .flex_1()
+            .min_h_0()
             .key_context(CONTEXT)
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &MoveUp, _, cx| this.move_rows(-1, cx)))
@@ -891,7 +903,9 @@ impl Render for DebugView {
                 this.find = None;
                 this.notice = None;
                 cx.notify();
-            }))
+            }));
+        let root = v_flex()
+            .size_full()
             .bg(theme.background)
             .text_color(theme.foreground);
 
@@ -902,15 +916,17 @@ impl Render for DebugView {
         let state = self.index.clone();
         let state = state.lock().expect("index lock poisoned");
         let palette = Palette { theme };
-        root.child(self.render_toolbar(&state, &palette, cx))
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.render_body(&state, &palette, window, cx))
-                    .child(self.render_inspector(&state, &palette, cx)),
-            )
-            .child(self.render_footer(&state, &palette))
+        root.child(self.render_toolbar(&state, &palette, cx)).child(
+            keyed
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .child(self.render_body(&state, &palette, window, cx))
+                        .child(self.render_inspector(&state, &palette, cx)),
+                )
+                .child(self.render_footer(&state, &palette)),
+        )
     }
 }
 
@@ -1188,7 +1204,8 @@ impl DebugView {
         let base = drawn.runs.iter().map(|(r, c)| (r.clone(), p.class(*c)));
         let mut overlays: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
         if let Some(needle) = &self.find {
-            for hit in find_all(content, needle) {
+            // Only the drawn part of a long line can show a hit.
+            for hit in find_all(&content[..content.len().min(MAX_DRAWN)], needle) {
                 overlays.push((
                     drawn.display_range(hit),
                     Palette::bg(theme.yellow.opacity(0.35)),
@@ -1353,7 +1370,10 @@ impl DebugView {
         let mut in_field = Vec::with_capacity(bytes.len());
         // Lines starting in this row, for the offset's color and tooltip.
         let mut starts: Vec<(String, Hsla)> = Vec::new();
-        let mut ix = state.line_at(start);
+        // Before the first line there may be a BOM, which belongs to no line.
+        let mut ix = state
+            .line_at(start)
+            .or_else(|| (state.lines > 0).then_some(0));
         let mut current: Option<(usize, Line, Arc<Vec<Field>>)> = None;
         for (i, &b) in bytes.iter().enumerate() {
             let off = start + i as u64;
@@ -1380,6 +1400,12 @@ impl DebugView {
                 break;
             }
             match &current {
+                // Outside any indexed line: a BOM, or bytes not indexed yet.
+                Some((_, l, _)) if off < l.start || off >= l.end() => {
+                    classes.push(Class::Muted);
+                    in_line.push(false);
+                    in_field.push(false);
+                }
                 Some((lix, l, fields)) => {
                     if off == l.start {
                         let what = state
@@ -1517,9 +1543,7 @@ impl DebugView {
         let height = self.body.get().size.height.as_f32();
         let visible = self.visible_rows();
         let (thumb_top, thumb_h) = if total > visible && height > 0. {
-            let h = (visible as f32 / total as f32 * height)
-                .max(24.)
-                .min(height);
+            let h = thumb_height(total, visible, height);
             let max_top = (total - visible) as f64;
             let top = (self.top as f64 / max_top) as f32 * (height - h);
             (top, h)
@@ -1717,7 +1741,8 @@ impl DebugView {
         };
         let delimiter = Self::delimiter(state);
         let fields = self.fields(self.line, &line, delimiter);
-        let content = self.content(&line).to_vec();
+        let data = self.data.clone();
+        let content = &data.as_slice()[line.content().start as usize..line.content().end as usize];
         let info = state.type_info(&line).cloned();
         let mapping = info.as_ref().and_then(|t| t.mapping.as_ref().ok()).cloned();
         let columns: &[String] = mapping.as_ref().map(|m| m.columns).unwrap_or_default();
@@ -1874,6 +1899,7 @@ impl DebugView {
         let field_rows: Vec<AnyElement> = fields
             .iter()
             .enumerate()
+            .take(MAX_FIELD_ROWS)
             .map(|(i, f)| {
                 let raw = &content[f.span.clone()];
                 let value = match line.kind {
@@ -2034,7 +2060,6 @@ impl DebugView {
         }
 
         // Copy helpers
-        let json = self.line_json(state);
         out.push(
             h_flex()
                 .gap_2()
@@ -2063,19 +2088,25 @@ impl DebugView {
                             cx.notify();
                         })),
                 )
-                .when_some(json, |d, json| {
-                    d.child(
-                        Button::new("copy-json")
-                            .small()
-                            .outline()
-                            .label("Copy as JSON")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(json.clone()));
+                .child(
+                    Button::new("copy-json")
+                        .small()
+                        .outline()
+                        .label("Copy as JSON")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let json = this
+                                .index
+                                .clone()
+                                .lock()
+                                .ok()
+                                .and_then(|s| this.line_json(&s));
+                            if let Some(json) = json {
+                                cx.write_to_clipboard(ClipboardItem::new_string(json));
                                 this.notice = Some(("Copied the line as JSON".into(), false));
                                 cx.notify();
-                            })),
-                    )
-                })
+                            }
+                        })),
+                )
                 .into_any_element(),
         );
         out
@@ -2286,6 +2317,16 @@ impl DebugView {
 // ---------------------------------------------------------------------------
 // Small pieces
 // ---------------------------------------------------------------------------
+
+/// The scrollbar thumb's height for `visible` of `total` rows.
+fn thumb_height(total: usize, visible: usize, height: f32) -> f32 {
+    if total <= visible {
+        return height;
+    }
+    (visible as f32 / total as f32 * height)
+        .max(24.)
+        .min(height)
+}
 
 fn section(title: &str, body: AnyElement, theme: &Theme) -> AnyElement {
     v_flex()

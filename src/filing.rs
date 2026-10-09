@@ -30,7 +30,7 @@ use web_time::Instant;
 use anyhow::Context as _;
 use fec_parser::{Delimiter, Filing, HeaderStyle, covers::Cover, report_code_label};
 
-use crate::debug::index::{is_begin_text, is_end_text, sniff};
+use crate::debug::index::{Quote, field_value, is_begin_text, is_end_text, sniff, split_delimited};
 
 /// Rows per collected chunk. Chunks are published whole, so row `i` always
 /// lives in chunk `i / CHUNK_ROWS`.
@@ -322,12 +322,16 @@ const SCAN_STEP: usize = 4096;
 /// Reads the records after the header and cover, skipping `[BEGINTEXT]` …
 /// `[ENDTEXT]` blocks the way `fec_parser` does.
 ///
-/// The delimiter and header style are sniffed with `fec_parser`'s rules:
-/// 0x1C for 6.x and later, commas (with quoting) for v1–5.x, whose header
-/// is either an `HDR` record or a `/* Header` … `/*` block.
+/// Like `fec_parser`, every physical line is at most one record: 0x1C files
+/// (6.x and later, and paper) are split with no quoting, and v1–5.x comma
+/// files are split with quoting that ends at the line's end. The header is an
+/// `HDR` record or a `/* Header` … `/*` block. Positions are where each line
+/// starts.
 struct Scanner {
-    rdr: csv::Reader<Box<dyn Read + Send>>,
+    lines: Lines,
+    line: Vec<u8>,
     record: csv::ByteRecord,
+    delimiter: Delimiter,
     preamble: Preamble,
     in_text: bool,
 }
@@ -338,7 +342,7 @@ enum Preamble {
     Block {
         opened: bool,
     },
-    /// This many records (the `HDR` record and the cover).
+    /// This many non-blank records (the `HDR` record and the cover).
     Records(usize),
     Done,
 }
@@ -351,18 +355,15 @@ impl Scanner {
         let mut head = Vec::new();
         source.reader()?.take(SNIFF_BYTES).read_to_end(&mut head)?;
         let facts = sniff(&head);
-        let rdr = csv::ReaderBuilder::new()
-            .delimiter(match facts.delimiter {
-                Delimiter::Fs => 0x1c,
-                Delimiter::Comma => b',',
-            })
-            .flexible(true)
-            .has_headers(false)
-            .buffer_capacity(READ_BUFFER)
-            .from_reader(source.reader()?);
+        let mut lines = Lines::new(source.reader()?);
+        if facts.bom {
+            lines.skip(3)?;
+        }
         Ok(Self {
-            rdr,
+            lines,
+            line: Vec::new(),
             record: csv::ByteRecord::new(),
+            delimiter: facts.delimiter,
             preamble: match facts.style {
                 HeaderStyle::LegacyBlock => Preamble::Block { opened: false },
                 _ => Preamble::Records(2),
@@ -375,14 +376,17 @@ impl Scanner {
     /// with its byte position. Returns `false` at the end of the file.
     fn step(&mut self, lines: usize, pass: &mut impl Pass) -> anyhow::Result<bool> {
         for _ in 0..lines {
-            if !self.rdr.read_byte_record(&mut self.record)? {
+            let Some(pos) = self.lines.next(&mut self.line)? else {
                 return Ok(false);
+            };
+            if self.line.is_empty() {
+                continue;
             }
-            let first = self.record.get(0).unwrap_or_default();
+            let line = &self.line;
             match &mut self.preamble {
                 Preamble::Done => {}
                 Preamble::Block { opened } => {
-                    if first.trim_ascii_start().starts_with(b"/*") {
+                    if line.trim_ascii_start().starts_with(b"/*") {
                         if *opened {
                             self.preamble = Preamble::Records(1); // the cover
                         } else {
@@ -392,16 +396,28 @@ impl Scanner {
                     continue;
                 }
                 Preamble::Records(n) => {
-                    if self.record.iter().all(|f| f.trim_ascii().is_empty()) {
-                        continue; // blank lines before the cover
-                    }
-                    *n -= 1;
-                    if *n == 0 {
-                        self.preamble = Preamble::Done;
+                    if !line.trim_ascii().is_empty() {
+                        *n -= 1;
+                        if *n == 0 {
+                            self.preamble = Preamble::Done;
+                        }
                     }
                     continue;
                 }
             }
+            // Comma files skip whitespace-only lines; 0x1C files read them
+            // as records with no row type, which are skipped below.
+            if self.delimiter == Delimiter::Comma && line.trim_ascii().is_empty() {
+                continue;
+            }
+            self.record.clear();
+            let delimiter = self.delimiter;
+            let record = &mut self.record;
+            split_delimited(line, delimiter, |f| match f.quote {
+                Quote::None => record.push_field(&line[f.span]),
+                quote => record.push_field(field_value(&line[f.span], quote, delimiter).as_bytes()),
+            });
+            let first = self.record.get(0).unwrap_or_default();
             if self.in_text {
                 self.in_text = !is_end_text(first);
                 continue;
@@ -414,10 +430,76 @@ impl Scanner {
             if row_type.is_empty() {
                 continue;
             }
-            let pos = self.record.position().map(|p| p.byte()).unwrap_or(0);
             pass.record(row_type, &self.record, pos);
         }
         Ok(true)
+    }
+}
+
+/// Physical lines, ending at `\n`, `\r\n` or a lone `\r`, with the byte
+/// offset each starts at.
+struct Lines {
+    rdr: std::io::BufReader<Box<dyn Read + Send>>,
+    pos: u64,
+    /// The last line ended at a `\r`; a `\n` right after belongs to it.
+    after_cr: bool,
+}
+
+impl Lines {
+    fn new(rdr: Box<dyn Read + Send>) -> Self {
+        Self {
+            rdr: std::io::BufReader::with_capacity(READ_BUFFER, rdr),
+            pos: 0,
+            after_cr: false,
+        }
+    }
+
+    fn skip(&mut self, n: usize) -> std::io::Result<()> {
+        use std::io::BufRead as _;
+        let mut left = n;
+        while left > 0 {
+            let available = self.rdr.fill_buf()?.len().min(left);
+            if available == 0 {
+                break;
+            }
+            self.rdr.consume(available);
+            self.pos += available as u64;
+            left -= available;
+        }
+        Ok(())
+    }
+
+    /// Read the next line (without its ending) into `out`; returns where it
+    /// starts, or `None` at the end of the file.
+    fn next(&mut self, out: &mut Vec<u8>) -> std::io::Result<Option<u64>> {
+        use std::io::BufRead as _;
+        out.clear();
+        if std::mem::take(&mut self.after_cr) && self.rdr.fill_buf()?.first() == Some(&b'\n') {
+            self.rdr.consume(1);
+            self.pos += 1;
+        }
+        let start = self.pos;
+        loop {
+            let buf = self.rdr.fill_buf()?;
+            if buf.is_empty() {
+                return Ok((self.pos > start).then_some(start));
+            }
+            match memchr::memchr2(b'\n', b'\r', buf) {
+                Some(i) => {
+                    out.extend_from_slice(&buf[..i]);
+                    self.after_cr = buf[i] == b'\r';
+                    self.rdr.consume(i + 1);
+                    self.pos += i as u64 + 1;
+                    return Ok(Some(start));
+                }
+                None => {
+                    let n = buf.len();
+                    out.extend_from_slice(buf);
+                    self.rdr.consume(n);
+                    self.pos += n as u64;
+                }
+            }
+        }
     }
 }
 
@@ -761,7 +843,7 @@ mod tests {
 
     const FS: char = '\x1c';
 
-    /// A small filing with the awkward bits: a quoted field holding a newline,
+    /// A small filing with the awkward bits: a quoted field holding the delimiter,
     /// a `[BEGINTEXT]` block whose lines look like records, and mixed case.
     fn sample() -> tempfile_path::TempPath {
         let rows = [
@@ -770,7 +852,7 @@ mod tests {
             "SA11AI|C00000001|a",
             "SA11AI|C00000001|b",
             "sa17|C00000001|c",
-            "SB23|C00000001|\"two\nlines\"",
+            "SB23|C00000001|\"two|lines\"",
             "[BEGINTEXT]",
             "SA11AI|this is prose, not a record",
             "[ENDTEXT]",
@@ -884,7 +966,8 @@ mod tests {
         assert_eq!(s.row_types, ["SA11AI", "sa17"]);
 
         let b = collect(file.path(), Matcher::RowType("SB23".into()));
-        assert_eq!(b.row(0), ["SB23", "C00000001", "two\nlines"]);
+        // No quoting in 0x1C files: the delimiter splits a quoted field.
+        assert_eq!(b.row(0), ["SB23", "C00000001", "\"two", "lines\""]);
     }
 
     /// v1–5.x filings: comma-delimited, with an `HDR` record or a
@@ -906,6 +989,17 @@ mod tests {
         );
         let c = count(hdr.path());
         assert_eq!(c.types, [("SA11A1".to_owned(), 1)]);
+
+        // An unclosed quote ends with its line, as in fec_parser; it doesn't
+        // swallow the `[ENDTEXT]` and the records after it.
+        let quote = tempfile_path::TempPath::with_contents(
+            "HDR,FEC,5.00\nF3XN,C1\n[BEGINTEXT]\n\"Dear sir,\n[ENDTEXT]\nSA11AI,C1,x\nSA11AI,C1,\"y\r\n",
+        );
+        let c = count(quote.path());
+        assert_eq!(c.types, [("SA11AI".to_owned(), 2)]);
+        let s = collect(quote.path(), Matcher::RowType("SA11AI".into()));
+        assert_eq!(s.row(1), ["SA11AI", "C1", "y"]);
+        assert_eq!(s.position(1), Some(66));
     }
 
     #[test]
