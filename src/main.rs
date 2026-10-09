@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod cover;
+mod debug;
 mod filing;
 #[cfg_attr(target_family = "wasm", allow(dead_code))]
 mod tabs;
@@ -130,6 +131,8 @@ fn main() {
             KeyBinding::new("secondary-m", Minimize, None),
         ]);
         tabs::init(cx);
+        debug::init(cx);
+        view::init(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(|_: &CloseWindow, cx| with_active_window(cx, |window| window.remove_window()));
         cx.on_action(|_: &Minimize, cx| with_active_window(cx, |window| window.minimize_window()));

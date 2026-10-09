@@ -11,6 +11,10 @@ anyhow = "1"
 jiff = "0.2"
 csv = "1.2.2"
 futures = "0.3"
+memchr = "2"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+memmap2 = "0.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

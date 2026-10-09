@@ -1822,6 +1822,8 @@ dependencies = [
  "gpui-kit",
  "jiff",
  "js-sys",
+ "memchr",
+ "memmap2",
  "objc2 0.6.4",
  "raw-window-handle",
  "wasm-bindgen",

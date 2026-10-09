@@ -55,6 +55,8 @@ pub fn main() {
 
     let handle = app.run_embedded(move |cx| {
         gpui_kit::init(cx);
+        crate::debug::init(cx);
+        crate::view::init(cx);
         // The web platform starts with no fonts. These must be in place
         // before the first window lays out any text. gpui's `.SystemUIFont`
         // resolves to IBM Plex Sans here.

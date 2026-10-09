@@ -7,7 +7,7 @@ use std::{
 use fec_parser::mappings::column_names_for_field;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _,
-    button::{Button, ButtonGroup},
+    button::{Button, ButtonGroup, ButtonVariants as _},
     h_flex,
     table::{Column, DataTable, TableDelegate, TableEvent, TableState},
     v_flex,
@@ -15,7 +15,14 @@ use gpui_kit::component::{
 use gpui_kit::{prelude::FluentBuilder as _, *};
 
 use crate::cover;
+use crate::debug::{self, DebugView};
 use crate::filing::{CollectState, Collection, Matcher, OpenFiling, Schedule, Source};
+
+actions!(fec_viewer, [ShowRawBytes]);
+
+pub fn init(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("secondary-shift-r", ShowRawBytes, None)]);
+}
 
 /// Cap on cached parsed rows; plenty for a screenful plus scroll-back.
 const ROW_CACHE_CAP: usize = 4_000;
@@ -24,6 +31,8 @@ const ROW_CACHE_CAP: usize = 4_000;
 enum Selection {
     Cover,
     Records(Matcher),
+    /// The debug view of the file's bytes.
+    Raw,
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +174,8 @@ pub struct FilingView {
     cover_raw: bool,
     selected_row: Option<usize>,
     table: Entity<TableState<RowsDelegate>>,
+    /// Made the first time the raw bytes are shown.
+    debug: Option<Entity<DebugView>>,
     _poll: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -194,6 +205,7 @@ impl FilingView {
             cover_raw: false,
             selected_row: None,
             table,
+            debug: None,
             _poll: None,
             _subscriptions: vec![subscription, appearance],
         };
@@ -215,6 +227,7 @@ impl FilingView {
         self.collection = None;
         self.collapsed.clear();
         self.selected_row = None;
+        self.debug = None;
         match OpenFiling::open(source) {
             Ok(filing) => {
                 self.filing = Some(filing);
@@ -306,6 +319,28 @@ impl FilingView {
         });
     }
 
+    /// Show the raw bytes, going to `target` if given.
+    fn show_raw(
+        &mut self,
+        target: Option<debug::Target>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(filing) = &self.filing else { return };
+        let source = filing.source.clone();
+        let view = self
+            .debug
+            .get_or_insert_with(|| cx.new(|cx| DebugView::new(&source, window, cx)))
+            .clone();
+        self.select(Selection::Raw, cx);
+        view.update(cx, |v, cx| {
+            if let Some(target) = target {
+                v.reveal(target, Some(debug::Mode::Lines), cx);
+            }
+        });
+        view.read(cx).focus_handle(cx).focus(window, cx);
+    }
+
     fn select(&mut self, selection: Selection, cx: &mut Context<Self>) {
         if self.selection == selection {
             return;
@@ -366,6 +401,13 @@ impl Render for FilingView {
             .text_color(theme.foreground)
             .text_sm()
             .on_drop(cx.listener(Self::on_drop_paths))
+            .on_action(cx.listener(|this, _: &ShowRawBytes, window, cx| {
+                if this.selection == Selection::Raw {
+                    this.select(Selection::Cover, cx);
+                } else {
+                    this.show_raw(None, window, cx);
+                }
+            }))
             .drag_over::<ExternalPaths>(|style, _, _, cx| style.bg(cx.theme().drop_target));
 
         match (&self.filing, &self.error) {
@@ -499,6 +541,17 @@ impl FilingView {
                 .on_click(cx.listener(|this, _, _, cx| this.select(Selection::Cover, cx))),
             )
             .child(
+                item(
+                    "raw".into(),
+                    None,
+                    "Raw bytes".into(),
+                    None,
+                    0,
+                    self.selection == Selection::Raw,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.show_raw(None, window, cx))),
+            )
+            .child(
                 div()
                     .px_4()
                     .pt_3()
@@ -586,6 +639,10 @@ impl FilingView {
     fn render_main(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match self.selection {
             Selection::Cover => self.render_cover(cx),
+            Selection::Raw => match &self.debug {
+                Some(view) => view.clone().into_any_element(),
+                None => div().into_any_element(),
+            },
             Selection::Records(_) => h_flex()
                 .size_full()
                 .child(
@@ -603,13 +660,41 @@ impl FilingView {
                         .zip(values.iter().cloned())
                         .filter(|(_, v)| !v.is_empty())
                         .collect();
-                    div()
+                    let position = self
+                        .collection
+                        .as_ref()
+                        .and_then(|c| c.state.lock().ok()?.position(row_ix));
+                    v_flex()
                         .w(px(360.))
                         .h_full()
                         .flex_shrink_0()
                         .border_l_1()
                         .border_color(cx.theme().border)
-                        .child(render_kv(("row-kv", row_ix), kv, cx))
+                        .children(position.map(|pos| {
+                            h_flex()
+                                .px_3()
+                                .py_2()
+                                .border_b_1()
+                                .border_color(cx.theme().border)
+                                .child(
+                                    Button::new("row-raw")
+                                        .small()
+                                        .outline()
+                                        .label("Show raw bytes")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.show_raw(
+                                                Some(debug::Target::RecordAt(pos)),
+                                                window,
+                                                cx,
+                                            )
+                                        })),
+                                )
+                        }))
+                        .child(div().flex_1().min_h_0().child(render_kv(
+                            ("row-kv", row_ix),
+                            kv,
+                            cx,
+                        )))
                 }))
                 .into_any_element(),
         };
@@ -650,17 +735,26 @@ impl FilingView {
                     cx.notify();
                 }))
         });
+        let show_bytes = Button::new("cover-bytes")
+            .small()
+            .ghost()
+            .label("Show raw bytes")
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.show_raw(Some(debug::Target::Cover), window, cx)
+            }));
         v_flex()
             .size_full()
-            .children(toggle.map(|t| {
+            .child(
                 h_flex()
                     .px_3()
                     .py_2()
+                    .gap_2()
                     .justify_end()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(t)
-            }))
+                    .child(show_bytes)
+                    .children(toggle),
+            )
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
     }

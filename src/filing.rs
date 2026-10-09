@@ -274,6 +274,11 @@ impl Schedule {
         SCHEDULES[self.0].1
     }
 
+    /// Position in a fixed list of schedules, for picking a color.
+    pub fn index(self) -> usize {
+        self.0
+    }
+
     /// What to call `row_type` under this schedule: the line number for
     /// `SA11AI` → `11AI`, but the whole type for `H4`.
     pub fn line_label(self, row_type: &str) -> String {
@@ -442,6 +447,43 @@ fn spawn_pass(
     Ok(())
 }
 
+/// Run `step` in the background until it returns `false` or `cancel` is set.
+/// Each call should do a few milliseconds of work: natively it runs on its
+/// own thread, but in the browser it shares the page's only thread, which it
+/// hands back every few calls.
+pub fn spawn_steps(
+    name: &str,
+    cancel: Arc<AtomicBool>,
+    mut step: impl FnMut() -> bool + Send + 'static,
+) -> std::io::Result<()> {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || while !cancel.load(Ordering::Relaxed) && step() {})?;
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = name;
+        const SLICE: Duration = Duration::from_millis(12);
+        wasm_bindgen_futures::spawn_local(async move {
+            loop {
+                let slice = Instant::now();
+                while slice.elapsed() < SLICE {
+                    if !step() {
+                        return;
+                    }
+                }
+                yield_to_browser().await;
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+            }
+        });
+    }
+    Ok(())
+}
+
 /// Resolve on a fresh macrotask, so the browser can paint and handle input.
 #[cfg(target_family = "wasm")]
 async fn yield_to_browser() {
@@ -515,10 +557,14 @@ pub struct Chunk {
     data: Vec<u8>,
     /// Start of each row in `data`, plus one trailing end offset.
     bounds: Vec<u32>,
+    /// Where each row was read in the file (as the csv reader reports it,
+    /// so possibly at a blank line or line ending just before the row).
+    positions: Vec<u64>,
 }
 
 impl Chunk {
-    fn push(&mut self, record: &csv::ByteRecord) {
+    fn push(&mut self, record: &csv::ByteRecord, pos: u64) {
+        self.positions.push(pos);
         if self.bounds.is_empty() {
             self.bounds.push(0);
         }
@@ -544,6 +590,10 @@ impl Chunk {
             .map(|f| String::from_utf8_lossy(f).trim().to_owned())
             .collect()
     }
+
+    pub fn position(&self, i: usize) -> Option<u64> {
+        self.positions.get(i).copied()
+    }
 }
 
 #[derive(Default)]
@@ -565,6 +615,11 @@ impl CollectState {
             .get(ix / CHUNK_ROWS)
             .map(|c| c.row(ix % CHUNK_ROWS))
             .unwrap_or_default()
+    }
+
+    /// Where row `ix` was read in the file; see [`Chunk::position`].
+    pub fn position(&self, ix: usize) -> Option<u64> {
+        self.chunks.get(ix / CHUNK_ROWS)?.position(ix % CHUNK_ROWS)
     }
 }
 
@@ -640,7 +695,7 @@ impl Pass for Collector {
             self.row_types.push(row_type.to_owned());
         }
         self.max_fields = self.max_fields.max(record.len());
-        self.chunk.push(record);
+        self.chunk.push(record, pos);
         if self.chunk.len() == CHUNK_ROWS {
             self.publish(pos, false, None);
         }
