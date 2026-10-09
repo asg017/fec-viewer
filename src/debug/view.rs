@@ -1351,7 +1351,8 @@ impl DebugView {
         let mut classes = Vec::with_capacity(bytes.len());
         let mut in_line = Vec::with_capacity(bytes.len());
         let mut in_field = Vec::with_capacity(bytes.len());
-        let mut annotations: Vec<String> = Vec::new();
+        // Lines starting in this row, for the offset's color and tooltip.
+        let mut starts: Vec<(String, Hsla)> = Vec::new();
         let mut ix = state.line_at(start);
         let mut current: Option<(usize, Line, Arc<Vec<Field>>)> = None;
         for (i, &b) in bytes.iter().enumerate() {
@@ -1385,7 +1386,14 @@ impl DebugView {
                             .type_info(l)
                             .map(|t| t.name.clone())
                             .unwrap_or_else(|| l.kind.label().to_string());
-                        annotations.push(format!("L{} {what}", fmt_count(*lix as u64 + 1)));
+                        let color = p.kind(l, state.type_info(l).map(|t| t.name.as_str()));
+                        starts.push((
+                            format!(
+                                "Line {} starts at {off:#x}: {what}",
+                                fmt_count(*lix as u64 + 1)
+                            ),
+                            color,
+                        ));
                     }
                     let rel = (off - l.start) as usize;
                     let in_content = off < l.content().end;
@@ -1472,24 +1480,28 @@ impl DebugView {
             .px_3()
             .whitespace_nowrap()
             .when(cursor_row, |d| d.bg(theme.list_hover))
-            .child(
+            .child({
+                // A line starting in this row colors the offset by its kind.
+                let color = starts.first().map_or(theme.muted_foreground, |(_, c)| *c);
+                let tip = starts
+                    .iter()
+                    .map(|(t, _)| t.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 div()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("{start:0w$X}")),
-            )
+                    .id(ElementId::NamedInteger("hex-offset".into(), row as u64))
+                    .text_color(color)
+                    .child(format!("{start:0w$X}"))
+                    .when(!tip.is_empty(), |d| {
+                        d.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    })
+            })
             .child(hex)
             .child(
                 h_flex()
                     .child(div().text_color(theme.muted_foreground).child("│"))
                     .child(ascii)
                     .child(div().text_color(theme.muted_foreground).child("│")),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .truncate()
-                    .child(annotations.join("  ")),
             )
             .into_any_element()
     }
