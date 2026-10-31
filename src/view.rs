@@ -6,21 +6,46 @@ use std::{
 
 use fec_parser::mappings::column_names_for_field;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, h_flex,
+    ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _,
+    button::{Button, ButtonGroup, ButtonVariants as _},
+    h_flex,
+    menu::{DropdownMenu as _, PopupMenuItem},
     table::{Column, DataTable, TableDelegate, TableEvent, TableState},
     v_flex,
 };
 use gpui_kit::{prelude::FluentBuilder as _, *};
 
+use crate::cover;
+use crate::debug::{self, DebugView};
+use crate::export::{self, Format};
 use crate::filing::{CollectState, Collection, Matcher, OpenFiling, Schedule, Source};
+
+actions!(fec_viewer, [ShowRawBytes]);
+
+pub fn init(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("secondary-shift-r", ShowRawBytes, None)]);
+}
+
+/// Group name for sidebar items, so their export buttons show on hover.
+const SIDEBAR_ITEM: &str = "sidebar-item";
 
 /// Cap on cached parsed rows; plenty for a screenful plus scroll-back.
 const ROW_CACHE_CAP: usize = 4_000;
+
+/// Where an export goes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Destination {
+    Clipboard,
+    /// A file: chosen with a save dialog, or a browser download.
+    File,
+}
 
 #[derive(Clone, PartialEq, Eq)]
 enum Selection {
     Cover,
     Records(Matcher),
+    /// The debug view of the file's bytes.
+    Raw,
 }
 
 // ---------------------------------------------------------------------------
@@ -158,8 +183,18 @@ pub struct FilingView {
     selection: Selection,
     collection: Option<Collection>,
     collapsed: HashSet<Schedule>,
+    /// Show the cover's raw fields instead of its form layout.
+    cover_raw: bool,
     selected_row: Option<usize>,
     table: Entity<TableState<RowsDelegate>>,
+    /// Made the first time the raw bytes are shown.
+    debug: Option<Entity<DebugView>>,
+    /// The export in progress; replacing it cancels it.
+    export: Option<Task<()>>,
+    /// How the last export went, for the status bar.
+    export_status: Option<String>,
+    /// The sidebar item whose export menu is open, so its buttons stay shown.
+    export_menu: Option<Matcher>,
     _poll: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -186,8 +221,13 @@ impl FilingView {
             selection: Selection::Cover,
             collection: None,
             collapsed: HashSet::new(),
+            cover_raw: false,
             selected_row: None,
             table,
+            debug: None,
+            export: None,
+            export_status: None,
+            export_menu: None,
             _poll: None,
             _subscriptions: vec![subscription, appearance],
         };
@@ -209,6 +249,9 @@ impl FilingView {
         self.collection = None;
         self.collapsed.clear();
         self.selected_row = None;
+        self.debug = None;
+        self.export = None;
+        self.export_status = None;
         match OpenFiling::open(source) {
             Ok(filing) => {
                 self.filing = Some(filing);
@@ -300,6 +343,28 @@ impl FilingView {
         });
     }
 
+    /// Show the raw bytes, going to `target` if given.
+    fn show_raw(
+        &mut self,
+        target: Option<debug::Target>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(filing) = &self.filing else { return };
+        let source = filing.source.clone();
+        let view = self
+            .debug
+            .get_or_insert_with(|| cx.new(|cx| DebugView::new(&source, window, cx)))
+            .clone();
+        self.select(Selection::Raw, cx);
+        view.update(cx, |v, cx| {
+            if let Some(target) = target {
+                v.reveal(target, Some(debug::Mode::Lines), cx);
+            }
+        });
+        view.read(cx).focus_handle(cx).focus(window, cx);
+    }
+
     fn select(&mut self, selection: Selection, cx: &mut Context<Self>) {
         if self.selection == selection {
             return;
@@ -325,6 +390,138 @@ impl FilingView {
             self.start_polling(cx);
         }
         cx.notify();
+    }
+
+    /// Copy or save every record `matcher` selects. The table's rows are
+    /// reused when they're all loaded; otherwise the file is scanned again.
+    fn export(
+        &mut self,
+        matcher: Matcher,
+        format: Format,
+        destination: Destination,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(filing) = self.filing.clone() else {
+            return;
+        };
+        let name = export::file_name(&filing.summary.filing_id, &matcher, format);
+        let loaded = match (&self.selection, &self.collection) {
+            (Selection::Records(m), Some(c)) if *m == matcher => c
+                .state
+                .lock()
+                .is_ok_and(|s| s.done)
+                .then(|| c.state.clone()),
+            _ => None,
+        };
+        // Held by the task below, so the scan stops if the export is replaced.
+        let (state, collection) = match loaded {
+            Some(state) => (state, None),
+            None => {
+                let c = filing.collect(matcher);
+                (c.state.clone(), Some(c))
+            }
+        };
+        #[cfg(not(target_family = "wasm"))]
+        let save_to = (destination == Destination::File)
+            .then(|| cx.prompt_for_new_path(&save_dir(&filing.source), Some(&name)));
+
+        self.export_status = Some(format!("Exporting {name}…"));
+        cx.notify();
+        self.export = Some(cx.spawn(async move |this, cx| {
+            let _collection = collection;
+            let report = |message: Option<String>, cx: &mut AsyncApp| {
+                let _ = this.update(cx, |this, cx| {
+                    this.export_status = message;
+                    cx.notify();
+                });
+            };
+
+            #[cfg(not(target_family = "wasm"))]
+            let path = match save_to {
+                None => None,
+                Some(rx) => match rx.await {
+                    Ok(Ok(Some(path))) => Some(path),
+                    Ok(Err(e)) => return report(Some(format!("Couldn't save: {e:#}")), cx),
+                    _ => return report(None, cx),
+                },
+            };
+
+            let rows = loop {
+                let (done, rows, error) = {
+                    let s = state.lock().expect("collect lock poisoned");
+                    (s.done, s.rows, s.error.clone())
+                };
+                if let Some(e) = error {
+                    return report(Some(format!("Couldn't export {name}: {e}")), cx);
+                }
+                if done {
+                    break rows;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+            };
+            let version = filing.summary.fec_version.clone();
+            // A copied CSV also goes on the clipboard as an HTML table, so it
+            // pastes into a spreadsheet as columns.
+            let with_html = destination == Destination::Clipboard && format == Format::Csv;
+            let (text, html) = cx
+                .background_executor()
+                .spawn(async move {
+                    let s = state.lock().expect("collect lock poisoned");
+                    let html = with_html.then(|| export::render_html_table(&s, &version));
+                    (export::render(&s, &version, format), html)
+                })
+                .await;
+
+            let rows = plural(rows, "row");
+            let message = match destination {
+                Destination::Clipboard => {
+                    let written = match &html {
+                        #[cfg(not(target_family = "wasm"))]
+                        Some(html) => crate::clipboard::write_html(&text, html),
+                        #[cfg(target_family = "wasm")]
+                        Some(html) => {
+                            crate::web::write_clipboard_html(text.clone(), html.clone()).await
+                        }
+                        None => Err(String::new()),
+                    };
+                    match written {
+                        Ok(()) => format!("Copied {rows} as {} (and a table)", format.label()),
+                        // No table wanted, or the platform refused one: plain text.
+                        Err(e) => {
+                            cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
+                            if e.is_empty() {
+                                format!("Copied {rows} as {}", format.label())
+                            } else {
+                                format!("Copied {rows} as {}, text only ({e})", format.label())
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(target_family = "wasm"))]
+                Destination::File => {
+                    let Some(path) = path else { return };
+                    let written = cx
+                        .background_executor()
+                        .spawn({
+                            let path = path.clone();
+                            async move { std::fs::write(path, text) }
+                        })
+                        .await;
+                    match written {
+                        Ok(()) => format!("Saved {rows} to {}", path.display()),
+                        Err(e) => format!("Couldn't save {}: {e}", path.display()),
+                    }
+                }
+                #[cfg(target_family = "wasm")]
+                Destination::File => match crate::web::download(&name, &text, format.mime()) {
+                    Ok(()) => format!("Downloaded {rows} as {name}"),
+                    Err(e) => format!("Couldn't download {name}: {e}"),
+                },
+            };
+            report(Some(message), cx);
+        }));
     }
 
     fn toggle_schedule(&mut self, schedule: Schedule, cx: &mut Context<Self>) {
@@ -360,11 +557,19 @@ impl Render for FilingView {
             .text_color(theme.foreground)
             .text_sm()
             .on_drop(cx.listener(Self::on_drop_paths))
+            .on_action(cx.listener(|this, _: &ShowRawBytes, window, cx| {
+                if this.selection == Selection::Raw {
+                    this.select(Selection::Cover, cx);
+                } else {
+                    this.show_raw(None, window, cx);
+                }
+            }))
             .drag_over::<ExternalPaths>(|style, _, _, cx| style.bg(cx.theme().drop_target));
 
         match (&self.filing, &self.error) {
-            (Some(_), _) => root
+            (Some(filing), _) => root
                 .child(self.render_header(cx))
+                .children(render_partial_warning(filing, cx))
                 .child(
                     h_flex()
                         .flex_1()
@@ -447,6 +652,8 @@ impl FilingView {
                     selected: bool| {
             h_flex()
                 .id(id)
+                .relative()
+                .group(SIDEBAR_ITEM)
                 .pl(px(8. + depth as f32 * 18.))
                 .pr_3()
                 .py_1()
@@ -493,6 +700,17 @@ impl FilingView {
                 .on_click(cx.listener(|this, _, _, cx| this.select(Selection::Cover, cx))),
             )
             .child(
+                item(
+                    "raw".into(),
+                    None,
+                    "Raw bytes".into(),
+                    None,
+                    0,
+                    self.selection == Selection::Raw,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.show_raw(None, window, cx))),
+            )
+            .child(
                 div()
                     .px_4()
                     .pt_3()
@@ -523,6 +741,7 @@ impl FilingView {
                     cx.stop_propagation();
                     this.toggle_schedule(schedule, cx);
                 }));
+            let selected = is_selected(&matcher);
             list = list.child(
                 item(
                     ElementId::Name(format!("schedule-{}", schedule.label()).into()),
@@ -530,8 +749,9 @@ impl FilingView {
                     schedule.label().into(),
                     Some(total),
                     0,
-                    is_selected(&matcher),
+                    selected,
                 )
+                .child(self.render_sidebar_export(&matcher, selected, cx))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.select(Selection::Records(matcher.clone()), cx)
                 })),
@@ -541,6 +761,7 @@ impl FilingView {
             }
             for (row_type, count) in lines {
                 let matcher = Matcher::RowType(row_type.clone());
+                let selected = is_selected(&matcher);
                 list = list.child(
                     item(
                         ElementId::Name(format!("line-{row_type}").into()),
@@ -548,9 +769,10 @@ impl FilingView {
                         schedule.line_label(&row_type),
                         Some(count),
                         1,
-                        is_selected(&matcher),
+                        selected,
                     )
-                    .font_family("monospace")
+                    .font_family(theme.mono_font_family.clone())
+                    .child(self.render_sidebar_export(&matcher, selected, cx))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select(Selection::Records(matcher.clone()), cx)
                     })),
@@ -559,6 +781,7 @@ impl FilingView {
         }
         for (row_type, count) in tree.other {
             let matcher = Matcher::RowType(row_type.clone());
+            let selected = is_selected(&matcher);
             list = list.child(
                 item(
                     ElementId::Name(format!("other-{row_type}").into()),
@@ -566,9 +789,10 @@ impl FilingView {
                     row_type,
                     Some(count),
                     0,
-                    is_selected(&matcher),
+                    selected,
                 )
-                .font_family("monospace")
+                .font_family(theme.mono_font_family.clone())
+                .child(self.render_sidebar_export(&matcher, selected, cx))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.select(Selection::Records(matcher.clone()), cx)
                 })),
@@ -577,44 +801,254 @@ impl FilingView {
         list
     }
 
+    /// Export buttons laid over a sidebar item's count while it's hovered
+    /// (or one of their menus is open).
+    fn render_sidebar_export(
+        &self,
+        matcher: &Matcher,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let bg = if selected {
+            theme.sidebar_accent
+        } else {
+            theme.list_hover
+        };
+        let shown = self.export_menu.as_ref() == Some(matcher);
+        h_flex()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_1()
+            .pl_1()
+            .gap_px()
+            .items_center()
+            .rounded_md()
+            .bg(bg)
+            .when(!shown, |d| {
+                d.opacity(0.).group_hover(SIDEBAR_ITEM, |s| s.opacity(1.))
+            })
+            // Clicking these shouldn't also select the item.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(self.export_button(matcher, Destination::Clipboard, true, cx))
+            .child(self.export_button(matcher, Destination::File, true, cx))
+    }
+
+    /// A button with a menu of formats to export `matcher`'s records in.
+    /// Compact buttons are icon-only.
+    fn export_button(
+        &self,
+        matcher: &Matcher,
+        destination: Destination,
+        compact: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (icon, label, item_label): (Icon, _, fn(Format) -> String) = match destination {
+            Destination::Clipboard => (Icon::new(IconName::Copy), "Copy", |f| {
+                format!("Copy as {}", f.label())
+            }),
+            #[cfg(not(target_family = "wasm"))]
+            Destination::File => (
+                Icon::new(gpui_kit::assets::IconName::Download),
+                "Save",
+                |f| format!("Save as {}…", f.label()),
+            ),
+            #[cfg(target_family = "wasm")]
+            Destination::File => (
+                Icon::new(gpui_kit::assets::IconName::Download),
+                "Download",
+                |f| format!("Download {}", f.label()),
+            ),
+        };
+        let key = match matcher {
+            Matcher::RowType(t) => t.clone(),
+            Matcher::Schedule(s) => s.label().to_owned(),
+        };
+        let id = format!(
+            "export-{key}-{label}-{}",
+            if compact { "sidebar" } else { "toolbar" }
+        );
+        let button = Button::new(ElementId::Name(id.into())).ghost().icon(icon);
+        let button = if compact {
+            button.xsmall().tooltip(label)
+        } else {
+            button.small().label(label)
+        };
+
+        let view = cx.entity().downgrade();
+        let menu_view = view.clone();
+        let menu_matcher = matcher.clone();
+        let open_matcher = matcher.clone();
+        button
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
+                for format in Format::ALL {
+                    let view = menu_view.clone();
+                    let matcher = menu_matcher.clone();
+                    menu = menu.item(PopupMenuItem::new(item_label(format)).on_click(
+                        move |_, _, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.export(matcher.clone(), format, destination, cx)
+                            });
+                        },
+                    ));
+                }
+                menu
+            })
+            .on_open_change(move |open, _, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    if *open {
+                        this.export_menu = Some(open_matcher.clone());
+                    } else if this.export_menu.as_ref() == Some(&open_matcher) {
+                        this.export_menu = None;
+                    }
+                    cx.notify();
+                });
+            })
+    }
+
     fn render_main(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match self.selection {
-            Selection::Cover => {
-                let kv = self
-                    .filing
-                    .as_ref()
-                    .map(|f| f.summary.cover_kv.clone())
-                    .unwrap_or_default();
-                render_kv("cover-kv", kv, cx).into_any_element()
-            }
-            Selection::Records(_) => h_flex()
+            Selection::Cover => self.render_cover(cx),
+            Selection::Raw => match &self.debug {
+                Some(view) => view.clone().into_any_element(),
+                None => div().into_any_element(),
+            },
+            Selection::Records(ref matcher) => v_flex()
                 .size_full()
                 .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .child(DataTable::new(&self.table).stripe(true)),
-                )
-                .children(self.selected_row.map(|row_ix| {
-                    let columns = self.table.read(cx).delegate().columns.clone();
-                    let values = self.table.update(cx, |t, _| t.delegate_mut().row(row_ix));
-                    let kv = columns
-                        .into_iter()
-                        .zip(values.iter().cloned())
-                        .filter(|(_, v)| !v.is_empty())
-                        .collect();
-                    div()
-                        .w(px(360.))
-                        .h_full()
-                        .flex_shrink_0()
-                        .border_l_1()
+                    h_flex()
+                        .px_3()
+                        .py_2()
+                        .gap_1()
+                        .justify_end()
+                        .border_b_1()
                         .border_color(cx.theme().border)
-                        .child(render_kv(("row-kv", row_ix), kv, cx))
-                }))
+                        .child(self.export_button(matcher, Destination::Clipboard, false, cx))
+                        .child(self.export_button(matcher, Destination::File, false, cx)),
+                )
+                .child(self.render_records(cx))
                 .into_any_element(),
         };
         div().flex_1().min_w_0().h_full().child(content)
+    }
+
+    /// The records table, and the selected row's fields beside it.
+    fn render_records(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(DataTable::new(&self.table).stripe(true)),
+            )
+            .children(self.selected_row.map(|row_ix| {
+                let columns = self.table.read(cx).delegate().columns.clone();
+                let values = self.table.update(cx, |t, _| t.delegate_mut().row(row_ix));
+                let kv = columns
+                    .into_iter()
+                    .zip(values.iter().cloned())
+                    .filter(|(_, v)| !v.is_empty())
+                    .collect();
+                let position = self
+                    .collection
+                    .as_ref()
+                    .and_then(|c| c.state.lock().ok()?.position(row_ix));
+                v_flex()
+                    .w(px(360.))
+                    .h_full()
+                    .flex_shrink_0()
+                    .border_l_1()
+                    .border_color(cx.theme().border)
+                    .children(position.map(|pos| {
+                        h_flex()
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(cx.theme().border)
+                            .child(
+                                Button::new("row-raw")
+                                    .small()
+                                    .outline()
+                                    .label("Show raw bytes")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.show_raw(
+                                            Some(debug::Target::RecordAt(pos)),
+                                            window,
+                                            cx,
+                                        )
+                                    })),
+                            )
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .child(render_kv(("row-kv", row_ix), kv, cx)),
+                    )
+            }))
+    }
+
+    /// The typed cover laid out for its form, or the raw cover fields for
+    /// forms without one (and on request).
+    fn render_cover(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(filing) = &self.filing else {
+            return div().into_any_element();
+        };
+        let s = &filing.summary;
+        let raw = self.cover_raw || s.cover.is_none();
+        let body = if raw {
+            render_kv("cover-kv", s.cover_kv.clone(), cx).into_any_element()
+        } else {
+            let mut children = s
+                .cover
+                .as_ref()
+                .map(|c| cover::render(c, cx))
+                .unwrap_or_default();
+            children.push(cover::filing_section(s, cx));
+            cover::layout::page("cover-page", children).into_any_element()
+        };
+        let toggle = s.cover.is_some().then(|| {
+            ButtonGroup::new("cover-mode")
+                .small()
+                .outline()
+                .child(
+                    Button::new("cover-formatted")
+                        .label("Formatted")
+                        .selected(!raw),
+                )
+                .child(Button::new("cover-raw").label("Raw fields").selected(raw))
+                .on_click(cx.listener(|this, selected: &Vec<usize>, _, cx| {
+                    this.cover_raw = selected.first() == Some(&1);
+                    cx.notify();
+                }))
+        });
+        let show_bytes = Button::new("cover-bytes")
+            .small()
+            .ghost()
+            .label("Show raw bytes")
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.show_raw(Some(debug::Target::Cover), window, cx)
+            }));
+        v_flex()
+            .size_full()
+            .child(
+                h_flex()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .justify_end()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(show_bytes)
+                    .children(toggle),
+            )
+            .child(div().flex_1().min_h_0().child(body))
+            .into_any_element()
     }
 
     fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -653,6 +1087,7 @@ impl FilingView {
                     format!("Loading… {pct:.0}% · {} rows", format_count(s.rows))
                 });
             }
+            parts.extend(self.export_status.clone());
         }
         h_flex()
             .px_3()
@@ -664,6 +1099,17 @@ impl FilingView {
             .border_color(theme.status_bar_border)
             .child(parts.join("   ·   "))
     }
+}
+
+/// Where a save dialog starts: next to the filing, if it's on disk.
+#[cfg(not(target_family = "wasm"))]
+fn save_dir(source: &Source) -> std::path::PathBuf {
+    match source {
+        Source::Path(path) => path.parent().map(Into::into),
+        Source::Bytes { .. } => None,
+    }
+    .or_else(|| std::env::current_dir().ok())
+    .unwrap_or_default()
 }
 
 fn render_kv(id: impl Into<ElementId>, kv: Vec<(String, String)>, cx: &App) -> impl IntoElement {
@@ -692,6 +1138,41 @@ fn render_kv(id: impl Into<ElementId>, kv: Vec<(String, String)>, cx: &App) -> i
         }))
 }
 
+/// A banner for a filing only partly fetched, so nothing it shows passes for
+/// the whole thing.
+fn render_partial_warning(filing: &OpenFiling, cx: &App) -> Option<impl IntoElement> {
+    let full_len = filing.source.truncated_from()?;
+    let theme = cx.theme();
+    let message = format!(
+        "Partial filing: only the first {} of {} was fetched, the most the browser demo can. \
+         Record counts, tables and exports cover only that part.",
+        format_bytes(filing.file_len),
+        format_bytes(full_len),
+    );
+    let bar = h_flex()
+        .px_3()
+        .py_2()
+        .gap_3()
+        .bg(theme.warning)
+        .text_color(theme.warning_foreground)
+        .font_weight(FontWeight::MEDIUM)
+        .child(div().flex_1().min_w_0().child(message));
+    #[cfg(target_family = "wasm")]
+    let bar = {
+        let url = crate::web::docquery_url(&filing.summary.filing_id);
+        bar.child(
+            Button::new("download-full")
+                .small()
+                .label("Download full filing")
+                .tooltip(
+                    "From docquery.fec.gov. Drop it on this page, or open it in the desktop app.",
+                )
+                .on_click(move |_, _, cx| cx.open_url(&url)),
+        )
+    };
+    Some(bar)
+}
+
 fn render_empty(error: Option<String>, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
     v_flex()
@@ -717,7 +1198,8 @@ fn empty_hint(cx: &App) -> impl IntoElement {
         .child("or choose File → Open… (⌘O / Ctrl+O)")
 }
 
-/// The browser has no File menu: offer a file picker and the bundled sample.
+/// The browser has no File menu: offer a file picker, lookup by filing ID,
+/// and the bundled sample.
 #[cfg(target_family = "wasm")]
 fn empty_hint(_: &App) -> impl IntoElement {
     use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -728,6 +1210,11 @@ fn empty_hint(_: &App) -> impl IntoElement {
             Button::new("choose-file")
                 .label("Choose a file…")
                 .on_click(|_, _, _| crate::web::choose_file()),
+        )
+        .child(
+            Button::new("open-by-id")
+                .label("Open filing by ID…")
+                .on_click(|_, _, _| crate::web::prompt_filing_id()),
         )
         .child(
             Button::new("load-sample")

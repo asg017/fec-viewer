@@ -1,5 +1,10 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+#[cfg(not(target_family = "wasm"))]
+mod clipboard;
+mod cover;
+mod debug;
+mod export;
 mod filing;
 #[cfg_attr(target_family = "wasm", allow(dead_code))]
 mod tabs;
@@ -16,6 +21,20 @@ use gpui_kit::*;
 use crate::{filing::Source, view::FilingView};
 
 actions!(fec_viewer, [Open, CloseWindow, Minimize, Zoom, Quit]);
+
+// Only the icons the viewer draws, embedded so they need no network (the
+// browser demo would otherwise fetch them from a CDN).
+gpui_kit::assets::icon_assets!(
+    Assets,
+    [
+        ChevronDown,
+        ChevronRight,
+        ChevronsUpDown,
+        Copy,
+        Download,
+        Inbox
+    ]
+);
 
 /// Windows we've opened, so "Open…" can reuse an empty one.
 #[derive(Default)]
@@ -113,7 +132,7 @@ fn main() {
 #[cfg(not(target_family = "wasm"))]
 fn main() {
     let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
-    let app = gpui_kit::application();
+    let app = gpui_kit::application().with_assets(Assets);
     app.on_open_urls(move |urls| {
         let _ = url_tx.unbounded_send(urls);
     });
@@ -129,6 +148,8 @@ fn main() {
             KeyBinding::new("secondary-m", Minimize, None),
         ]);
         tabs::init(cx);
+        debug::init(cx);
+        view::init(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(|_: &CloseWindow, cx| with_active_window(cx, |window| window.remove_window()));
         cx.on_action(|_: &Minimize, cx| with_active_window(cx, |window| window.minimize_window()));

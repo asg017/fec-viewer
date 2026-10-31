@@ -28,7 +28,9 @@ use std::time::Instant;
 use web_time::Instant;
 
 use anyhow::Context as _;
-use fec_parser::{Filing, report_code_label};
+use fec_parser::{Delimiter, Filing, HeaderStyle, covers::Cover, report_code_label};
+
+use crate::debug::index::{Quote, field_value, is_begin_text, is_end_text, sniff, split_delimited};
 
 /// Rows per collected chunk. Chunks are published whole, so row `i` always
 /// lives in chunk `i / CHUNK_ROWS`.
@@ -44,12 +46,45 @@ pub struct FilingSummary {
     pub filer_name: String,
     pub filer_id: String,
     pub form_type: String,
+    /// The form-specific report type for 24/48-hour notices (F24, F5), else
+    /// the report code's label.
     pub report_label: Option<&'static str>,
     pub coverage_from: Option<String>,
     pub coverage_through: Option<String>,
     pub fec_version: String,
     pub software: String,
+    pub report_id: Option<String>,
+    pub report_number: Option<String>,
+    pub comment: Option<String>,
     pub cover_kv: Vec<(String, String)>,
+    /// The typed cover, when `fec_parser` understands the form.
+    pub cover: Option<Cover>,
+}
+
+impl FilingSummary {
+    /// The filing's page on docquery.fec.gov, for filings with a numeric ID.
+    pub fn fec_url(&self) -> Option<String> {
+        let numeric =
+            !self.filing_id.is_empty() && self.filing_id.bytes().all(|b| b.is_ascii_digit());
+        (numeric && !self.filer_id.is_empty()).then(|| {
+            format!(
+                "https://docquery.fec.gov/cgi-bin/forms/{}/{}",
+                self.filer_id, self.filing_id
+            )
+        })
+    }
+}
+
+fn report_label(cover: Option<&Cover>, report_code: Option<&str>) -> Option<&'static str> {
+    let form_specific = match cover {
+        Some(Cover::Form24(f)) => f.report_type_label(),
+        Some(Cover::Form5(f)) => f.report_type_label(),
+        _ => None,
+    };
+    form_specific.or_else(|| match report_code_label(report_code?) {
+        "[Unknown report code]" => None,
+        label => Some(label),
+    })
 }
 
 #[derive(Default)]
@@ -69,9 +104,15 @@ pub enum Source {
     /// A file on disk, reopened for every pass.
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
     Path(PathBuf),
-    /// A whole file already in memory, shared by every pass.
+    /// A file already in memory, shared by every pass.
     #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
-    Bytes { name: String, bytes: Arc<[u8]> },
+    Bytes {
+        name: String,
+        bytes: Arc<[u8]>,
+        /// The whole file's size, when `bytes` is only its first part (the
+        /// browser demo can only fetch so much of a filing).
+        full_len: Option<u64>,
+    },
 }
 
 impl Source {
@@ -83,6 +124,14 @@ impl Source {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string()),
             Source::Bytes { name, .. } => name.clone(),
+        }
+    }
+
+    /// The whole file's size, if only the first part of it is here.
+    pub fn truncated_from(&self) -> Option<u64> {
+        match self {
+            Source::Path(_) => None,
+            Source::Bytes { full_len, .. } => *full_len,
         }
     }
 
@@ -126,7 +175,7 @@ impl OpenFiling {
     pub fn open(source: Source) -> anyhow::Result<Arc<Self>> {
         let (summary, file_len) = match &source {
             Source::Path(path) => Filing::<File>::from_path(path).map(summarize),
-            Source::Bytes { name, bytes } => {
+            Source::Bytes { name, bytes, .. } => {
                 let id = Path::new(name)
                     .file_stem()
                     .map_or_else(|| name.clone(), |s| s.to_string_lossy().into_owned());
@@ -181,7 +230,7 @@ fn summarize<R: Read>(filing: Filing<R>) -> (FilingSummary, u64) {
         filer_name: cover.filer_name.clone(),
         filer_id: cover.filer_id.clone(),
         form_type: cover.form_type.clone(),
-        report_label: cover.report_code.as_deref().map(report_code_label),
+        report_label: report_label(cover.cover_data.as_ref(), cover.report_code.as_deref()),
         coverage_from: cover.coverage_from_date.map(|d| d.to_string()),
         coverage_through: cover.coverage_through_date.map(|d| d.to_string()),
         fec_version: filing.header.fec_version.clone(),
@@ -189,11 +238,15 @@ fn summarize<R: Read>(filing: Filing<R>) -> (FilingSummary, u64) {
             "{} {}",
             filing.header.software_name, filing.header.software_version
         ),
+        report_id: filing.header.report_id.clone(),
+        report_number: filing.header.report_number.clone(),
+        comment: filing.header.comment.clone(),
         cover_kv: cover
             .cover_record_kv
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
+        cover: cover.cover_data.clone(),
     };
     (summary, filing.source_length as u64)
 }
@@ -237,6 +290,11 @@ impl Schedule {
         SCHEDULES[self.0].1
     }
 
+    /// Position in a fixed list of schedules, for picking a color.
+    pub fn index(self) -> usize {
+        self.0
+    }
+
     /// What to call `row_type` under this schedule: the line number for
     /// `SA11AI` → `11AI`, but the whole type for `H4`.
     pub fn line_label(self, row_type: &str) -> String {
@@ -277,25 +335,53 @@ const SCAN_STEP: usize = 4096;
 
 /// Reads the records after the header and cover, skipping `[BEGINTEXT]` …
 /// `[ENDTEXT]` blocks the way `fec_parser` does.
+///
+/// Like `fec_parser`, every physical line is at most one record: 0x1C files
+/// (6.x and later, and paper) are split with no quoting, and v1–5.x comma
+/// files are split with quoting that ends at the line's end. The header is an
+/// `HDR` record or a `/* Header` … `/*` block. Positions are where each line
+/// starts.
 struct Scanner {
-    rdr: csv::Reader<Box<dyn Read + Send>>,
+    lines: Lines,
+    line: Vec<u8>,
     record: csv::ByteRecord,
-    seen: usize,
+    delimiter: Delimiter,
+    preamble: Preamble,
     in_text: bool,
 }
 
+/// What's left to skip before the body.
+enum Preamble {
+    /// A `/* Header` block (until its closing `/*` line), then the cover.
+    Block {
+        opened: bool,
+    },
+    /// This many non-blank records (the `HDR` record and the cover).
+    Records(usize),
+    Done,
+}
+
+/// Bytes read to sniff the format; the first line must fit (as in `fec_parser`).
+const SNIFF_BYTES: u64 = 1 << 20;
+
 impl Scanner {
     fn new(source: &Source) -> anyhow::Result<Self> {
-        let rdr = csv::ReaderBuilder::new()
-            .delimiter(0x1c)
-            .flexible(true)
-            .has_headers(false)
-            .buffer_capacity(READ_BUFFER)
-            .from_reader(source.reader()?);
+        let mut head = Vec::new();
+        source.reader()?.take(SNIFF_BYTES).read_to_end(&mut head)?;
+        let facts = sniff(&head);
+        let mut lines = Lines::new(source.reader()?);
+        if facts.bom {
+            lines.skip(3)?;
+        }
         Ok(Self {
-            rdr,
+            lines,
+            line: Vec::new(),
             record: csv::ByteRecord::new(),
-            seen: 0,
+            delimiter: facts.delimiter,
+            preamble: match facts.style {
+                HeaderStyle::LegacyBlock => Preamble::Block { opened: false },
+                _ => Preamble::Records(2),
+            },
             in_text: false,
         })
     }
@@ -304,19 +390,53 @@ impl Scanner {
     /// with its byte position. Returns `false` at the end of the file.
     fn step(&mut self, lines: usize, pass: &mut impl Pass) -> anyhow::Result<bool> {
         for _ in 0..lines {
-            if !self.rdr.read_byte_record(&mut self.record)? {
+            let Some(pos) = self.lines.next(&mut self.line)? else {
                 return Ok(false);
-            }
-            self.seen += 1;
-            if self.seen <= 2 {
-                continue; // HDR + cover
-            }
-            let first = self.record.get(0).unwrap_or_default();
-            if self.in_text {
-                self.in_text = first != b"[ENDTEXT]";
+            };
+            if self.line.is_empty() {
                 continue;
             }
-            if first == b"[BEGINTEXT]" {
+            let line = &self.line;
+            match &mut self.preamble {
+                Preamble::Done => {}
+                Preamble::Block { opened } => {
+                    if line.trim_ascii_start().starts_with(b"/*") {
+                        if *opened {
+                            self.preamble = Preamble::Records(1); // the cover
+                        } else {
+                            *opened = true;
+                        }
+                    }
+                    continue;
+                }
+                Preamble::Records(n) => {
+                    if !line.trim_ascii().is_empty() {
+                        *n -= 1;
+                        if *n == 0 {
+                            self.preamble = Preamble::Done;
+                        }
+                    }
+                    continue;
+                }
+            }
+            // Comma files skip whitespace-only lines; 0x1C files read them
+            // as records with no row type, which are skipped below.
+            if self.delimiter == Delimiter::Comma && line.trim_ascii().is_empty() {
+                continue;
+            }
+            self.record.clear();
+            let delimiter = self.delimiter;
+            let record = &mut self.record;
+            split_delimited(line, delimiter, |f| match f.quote {
+                Quote::None => record.push_field(&line[f.span]),
+                quote => record.push_field(field_value(&line[f.span], quote, delimiter).as_bytes()),
+            });
+            let first = self.record.get(0).unwrap_or_default();
+            if self.in_text {
+                self.in_text = !is_end_text(first);
+                continue;
+            }
+            if is_begin_text(first) {
                 self.in_text = true;
                 continue;
             }
@@ -324,10 +444,76 @@ impl Scanner {
             if row_type.is_empty() {
                 continue;
             }
-            let pos = self.record.position().map(|p| p.byte()).unwrap_or(0);
             pass.record(row_type, &self.record, pos);
         }
         Ok(true)
+    }
+}
+
+/// Physical lines, ending at `\n`, `\r\n` or a lone `\r`, with the byte
+/// offset each starts at.
+struct Lines {
+    rdr: std::io::BufReader<Box<dyn Read + Send>>,
+    pos: u64,
+    /// The last line ended at a `\r`; a `\n` right after belongs to it.
+    after_cr: bool,
+}
+
+impl Lines {
+    fn new(rdr: Box<dyn Read + Send>) -> Self {
+        Self {
+            rdr: std::io::BufReader::with_capacity(READ_BUFFER, rdr),
+            pos: 0,
+            after_cr: false,
+        }
+    }
+
+    fn skip(&mut self, n: usize) -> std::io::Result<()> {
+        use std::io::BufRead as _;
+        let mut left = n;
+        while left > 0 {
+            let available = self.rdr.fill_buf()?.len().min(left);
+            if available == 0 {
+                break;
+            }
+            self.rdr.consume(available);
+            self.pos += available as u64;
+            left -= available;
+        }
+        Ok(())
+    }
+
+    /// Read the next line (without its ending) into `out`; returns where it
+    /// starts, or `None` at the end of the file.
+    fn next(&mut self, out: &mut Vec<u8>) -> std::io::Result<Option<u64>> {
+        use std::io::BufRead as _;
+        out.clear();
+        if std::mem::take(&mut self.after_cr) && self.rdr.fill_buf()?.first() == Some(&b'\n') {
+            self.rdr.consume(1);
+            self.pos += 1;
+        }
+        let start = self.pos;
+        loop {
+            let buf = self.rdr.fill_buf()?;
+            if buf.is_empty() {
+                return Ok((self.pos > start).then_some(start));
+            }
+            match memchr::memchr2(b'\n', b'\r', buf) {
+                Some(i) => {
+                    out.extend_from_slice(&buf[..i]);
+                    self.after_cr = buf[i] == b'\r';
+                    self.rdr.consume(i + 1);
+                    self.pos += i as u64 + 1;
+                    return Ok(Some(start));
+                }
+                None => {
+                    let n = buf.len();
+                    out.extend_from_slice(buf);
+                    self.rdr.consume(n);
+                    self.pos += n as u64;
+                }
+            }
+        }
     }
 }
 
@@ -405,6 +591,43 @@ fn spawn_pass(
     Ok(())
 }
 
+/// Run `step` in the background until it returns `false` or `cancel` is set.
+/// Each call should do a few milliseconds of work: natively it runs on its
+/// own thread, but in the browser it shares the page's only thread, which it
+/// hands back every few calls.
+pub fn spawn_steps(
+    name: &str,
+    cancel: Arc<AtomicBool>,
+    mut step: impl FnMut() -> bool + Send + 'static,
+) -> std::io::Result<()> {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || while !cancel.load(Ordering::Relaxed) && step() {})?;
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = name;
+        const SLICE: Duration = Duration::from_millis(12);
+        wasm_bindgen_futures::spawn_local(async move {
+            loop {
+                let slice = Instant::now();
+                while slice.elapsed() < SLICE {
+                    if !step() {
+                        return;
+                    }
+                }
+                yield_to_browser().await;
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+            }
+        });
+    }
+    Ok(())
+}
+
 /// Resolve on a fresh macrotask, so the browser can paint and handle input.
 #[cfg(target_family = "wasm")]
 async fn yield_to_browser() {
@@ -478,10 +701,14 @@ pub struct Chunk {
     data: Vec<u8>,
     /// Start of each row in `data`, plus one trailing end offset.
     bounds: Vec<u32>,
+    /// Where each row was read in the file (as the csv reader reports it,
+    /// so possibly at a blank line or line ending just before the row).
+    positions: Vec<u64>,
 }
 
 impl Chunk {
-    fn push(&mut self, record: &csv::ByteRecord) {
+    fn push(&mut self, record: &csv::ByteRecord, pos: u64) {
+        self.positions.push(pos);
         if self.bounds.is_empty() {
             self.bounds.push(0);
         }
@@ -507,6 +734,10 @@ impl Chunk {
             .map(|f| String::from_utf8_lossy(f).trim().to_owned())
             .collect()
     }
+
+    pub fn position(&self, i: usize) -> Option<u64> {
+        self.positions.get(i).copied()
+    }
 }
 
 #[derive(Default)]
@@ -528,6 +759,27 @@ impl CollectState {
             .get(ix / CHUNK_ROWS)
             .map(|c| c.row(ix % CHUNK_ROWS))
             .unwrap_or_default()
+    }
+
+    /// Where row `ix` was read in the file; see [`Chunk::position`].
+    pub fn position(&self, ix: usize) -> Option<u64> {
+        self.chunks.get(ix / CHUNK_ROWS)?.position(ix % CHUNK_ROWS)
+    }
+
+    /// A finished collection of these rows, in one chunk.
+    #[cfg(test)]
+    pub fn from_rows(rows: &[&[&str]]) -> Self {
+        let mut chunk = Chunk::default();
+        for row in rows {
+            chunk.push(&csv::ByteRecord::from(row.to_vec()), 0);
+        }
+        Self {
+            rows: chunk.len(),
+            max_fields: rows.iter().map(|r| r.len()).max().unwrap_or(0),
+            chunks: vec![Arc::new(chunk)],
+            done: true,
+            ..Default::default()
+        }
     }
 }
 
@@ -603,7 +855,7 @@ impl Pass for Collector {
             self.row_types.push(row_type.to_owned());
         }
         self.max_fields = self.max_fields.max(record.len());
-        self.chunk.push(record);
+        self.chunk.push(record, pos);
         if self.chunk.len() == CHUNK_ROWS {
             self.publish(pos, false, None);
         }
@@ -621,7 +873,7 @@ mod tests {
 
     const FS: char = '\x1c';
 
-    /// A small filing with the awkward bits: a quoted field holding a newline,
+    /// A small filing with the awkward bits: a quoted field holding the delimiter,
     /// a `[BEGINTEXT]` block whose lines look like records, and mixed case.
     fn sample() -> tempfile_path::TempPath {
         let rows = [
@@ -630,7 +882,7 @@ mod tests {
             "SA11AI|C00000001|a",
             "SA11AI|C00000001|b",
             "sa17|C00000001|c",
-            "SB23|C00000001|\"two\nlines\"",
+            "SB23|C00000001|\"two|lines\"",
             "[BEGINTEXT]",
             "SA11AI|this is prose, not a record",
             "[ENDTEXT]",
@@ -677,6 +929,7 @@ mod tests {
         let bytes = Source::Bytes {
             name: "1234.fec".into(),
             bytes: std::fs::read(file.path()).unwrap().into(),
+            full_len: None,
         };
         let (a, b) = (count(file.path()), count_source(&bytes));
         assert_eq!(a.types, b.types);
@@ -744,7 +997,40 @@ mod tests {
         assert_eq!(s.row_types, ["SA11AI", "sa17"]);
 
         let b = collect(file.path(), Matcher::RowType("SB23".into()));
-        assert_eq!(b.row(0), ["SB23", "C00000001", "two\nlines"]);
+        // No quoting in 0x1C files: the delimiter splits a quoted field.
+        assert_eq!(b.row(0), ["SB23", "C00000001", "\"two", "lines\""]);
+    }
+
+    /// v1–5.x filings: comma-delimited, with an `HDR` record or a
+    /// `/* Header` block, and text markers in any case.
+    #[test]
+    fn reads_legacy_comma_filings() {
+        let block = tempfile_path::TempPath::with_contents(
+            "/* Header\nFEC_Ver_# = 2.02\nSA16 = 00001\n/* End Header\nF3PN,C001,\"Smith, Jo\"\n\
+             SA16,C001,\"A, B\"\n[BEGIN TEXT]\nSA16,prose\n[EndText]\nSB23,C001,x\n",
+        );
+        let c = count(block.path());
+        assert!(c.done && c.error.is_none(), "{:?}", c.error);
+        assert_eq!(c.types, [("SA16".into(), 1), ("SB23".into(), 1)]);
+        let s = collect(block.path(), Matcher::RowType("SA16".into()));
+        assert_eq!(s.row(0), ["SA16", "C001", "A, B"]);
+
+        let hdr = tempfile_path::TempPath::with_contents(
+            "\"HDR\",\"FEC\",\"5.00\",\"X\",\"1\"\n\n\"F3XN\",\"C001\"\n\"SA11A1\",\"C001\",\"x\"\n",
+        );
+        let c = count(hdr.path());
+        assert_eq!(c.types, [("SA11A1".to_owned(), 1)]);
+
+        // An unclosed quote ends with its line, as in fec_parser; it doesn't
+        // swallow the `[ENDTEXT]` and the records after it.
+        let quote = tempfile_path::TempPath::with_contents(
+            "HDR,FEC,5.00\nF3XN,C1\n[BEGINTEXT]\n\"Dear sir,\n[ENDTEXT]\nSA11AI,C1,x\nSA11AI,C1,\"y\r\n",
+        );
+        let c = count(quote.path());
+        assert_eq!(c.types, [("SA11AI".to_owned(), 2)]);
+        let s = collect(quote.path(), Matcher::RowType("SA11AI".into()));
+        assert_eq!(s.row(1), ["SA11AI", "C1", "y"]);
+        assert_eq!(s.position(1), Some(66));
     }
 
     #[test]
