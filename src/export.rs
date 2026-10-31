@@ -78,9 +78,54 @@ pub fn render(state: &CollectState, fec_version: &str, format: Format) -> String
     }
 }
 
+/// Every collected row of `state` as an HTML `<table>`, header row first,
+/// for the clipboard next to CSV: spreadsheets paste it as columns.
+pub fn render_html_table(state: &CollectState, fec_version: &str) -> String {
+    let mut names = Names::new(fec_version);
+    let (header, index) = columns(state, &mut names);
+    let mut out = String::from("<meta charset=\"utf-8\"><table>\n<thead><tr>");
+    for name in &header {
+        out.push_str("<th>");
+        push_html_escaped(&mut out, name);
+        out.push_str("</th>");
+    }
+    out.push_str("</tr></thead>\n<tbody>\n");
+    for ix in 0..state.rows {
+        let row = state.row(ix);
+        out.push_str("<tr>");
+        for value in record(&row, &mut names, &index, header.len()) {
+            // Excel keeps leading zeros (ZIP codes, IDs) only in text cells.
+            if is_zero_padded(value) {
+                out.push_str("<td style=\"mso-number-format:'\\@'\">");
+            } else {
+                out.push_str("<td>");
+            }
+            push_html_escaped(&mut out, value);
+            out.push_str("</td>");
+        }
+        out.push_str("</tr>\n");
+    }
+    out.push_str("</tbody>\n</table>\n");
+    out
+}
+
 fn render_csv(state: &CollectState, names: &mut Names) -> String {
-    // Every column any row has, in first-seen order. Rows are read twice, but
-    // that's cheap next to the scan that collected them.
+    let (header, index) = columns(state, names);
+    let mut out = csv::Writer::from_writer(Vec::new());
+    // Writing to a Vec can't fail.
+    out.write_record(&header).expect("csv write");
+    for ix in 0..state.rows {
+        let row = state.row(ix);
+        out.write_record(record(&row, names, &index, header.len()))
+            .expect("csv write");
+    }
+    String::from_utf8(out.into_inner().expect("csv flush")).expect("csv of strings is UTF-8")
+}
+
+/// Every column any row has, in first-seen order, and where each one is.
+/// Rows are read again for the values, but that's cheap next to the scan
+/// that collected them.
+fn columns(state: &CollectState, names: &mut Names) -> (Vec<String>, HashMap<String, usize>) {
     let mut header: Vec<String> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for ix in 0..state.rows {
@@ -91,19 +136,39 @@ fn render_csv(state: &CollectState, names: &mut Names) -> String {
             }
         }
     }
+    (header, index)
+}
 
-    let mut out = csv::Writer::from_writer(Vec::new());
-    // Writing to a Vec can't fail.
-    out.write_record(&header).expect("csv write");
-    for ix in 0..state.rows {
-        let row = state.row(ix);
-        let mut record = vec![""; header.len()];
-        for (name, value) in names.for_row(&row).iter().zip(&row) {
-            record[index[name]] = value;
-        }
-        out.write_record(&record).expect("csv write");
+/// `row`'s values placed in the table's columns, blank where it has none.
+fn record<'a>(
+    row: &'a [String],
+    names: &mut Names,
+    index: &HashMap<String, usize>,
+    width: usize,
+) -> Vec<&'a str> {
+    let mut record = vec![""; width];
+    for (name, value) in names.for_row(row).iter().zip(row) {
+        record[index[name]] = value;
     }
-    String::from_utf8(out.into_inner().expect("csv flush")).expect("csv of strings is UTF-8")
+    record
+}
+
+/// Digits with a leading zero, like `02134`, that a spreadsheet would
+/// otherwise read as a number and strip.
+fn is_zero_padded(value: &str) -> bool {
+    value.len() > 1 && value.starts_with('0') && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn push_html_escaped(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            c => out.push(c),
+        }
+    }
 }
 
 /// An array of objects, one per line.
@@ -190,6 +255,21 @@ mod tests {
         assert_eq!(
             render(&s, "8.4", Format::Csv),
             "extra_0,extra_1,extra_2\nZZ,\"a,b\",\"say \"\"hi\"\"\"\nZZ,c,\n"
+        );
+    }
+
+    #[test]
+    fn html_table_escapes_and_keeps_leading_zeros() {
+        let s = state(&[&["ZZ", "<a & \"b\">", "02134"], &["ZZ", "0"]]);
+        assert_eq!(
+            render_html_table(&s, "8.4"),
+            "<meta charset=\"utf-8\"><table>\n\
+             <thead><tr><th>extra_0</th><th>extra_1</th><th>extra_2</th></tr></thead>\n\
+             <tbody>\n\
+             <tr><td>ZZ</td><td>&lt;a &amp; &quot;b&quot;&gt;</td>\
+             <td style=\"mso-number-format:'\\@'\">02134</td></tr>\n\
+             <tr><td>ZZ</td><td>0</td><td></td></tr>\n\
+             </tbody>\n</table>\n"
         );
     }
 

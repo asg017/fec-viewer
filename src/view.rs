@@ -462,19 +462,42 @@ impl FilingView {
                     .await;
             };
             let version = filing.summary.fec_version.clone();
-            let text = cx
+            // A copied CSV also goes on the clipboard as an HTML table, so it
+            // pastes into a spreadsheet as columns.
+            let with_html = destination == Destination::Clipboard && format == Format::Csv;
+            let (text, html) = cx
                 .background_executor()
                 .spawn(async move {
                     let s = state.lock().expect("collect lock poisoned");
-                    export::render(&s, &version, format)
+                    let html = with_html.then(|| export::render_html_table(&s, &version));
+                    (export::render(&s, &version, format), html)
                 })
                 .await;
 
             let rows = plural(rows, "row");
             let message = match destination {
                 Destination::Clipboard => {
-                    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
-                    format!("Copied {rows} as {}", format.label())
+                    let written = match &html {
+                        #[cfg(not(target_family = "wasm"))]
+                        Some(html) => crate::clipboard::write_html(&text, html),
+                        #[cfg(target_family = "wasm")]
+                        Some(html) => {
+                            crate::web::write_clipboard_html(text.clone(), html.clone()).await
+                        }
+                        None => Err(String::new()),
+                    };
+                    match written {
+                        Ok(()) => format!("Copied {rows} as {} (and a table)", format.label()),
+                        // No table wanted, or the platform refused one: plain text.
+                        Err(e) => {
+                            cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
+                            if e.is_empty() {
+                                format!("Copied {rows} as {}", format.label())
+                            } else {
+                                format!("Copied {rows} as {}, text only ({e})", format.label())
+                            }
+                        }
+                    }
                 }
                 #[cfg(not(target_family = "wasm"))]
                 Destination::File => {

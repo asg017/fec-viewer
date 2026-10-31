@@ -334,3 +334,32 @@ pub fn download(name: &str, contents: &str, mime: &str) -> Result<(), String> {
         .set_timeout_with_callback_and_timeout_and_arguments_0(revoke.unchecked_ref(), 10_000);
     Ok(())
 }
+
+/// Put `html` on the clipboard, with `text` for apps that don't read HTML.
+/// The browser only allows a few types; these two are the ones spreadsheets
+/// and text editors read.
+pub async fn write_clipboard_html(text: String, html: String) -> Result<(), String> {
+    let window = web_sys::window().ok_or("no window")?;
+    let blob = |contents: &str, mime: &str| {
+        let options = web_sys::BlobPropertyBag::new();
+        options.set_type(mime);
+        web_sys::Blob::new_with_str_sequence_and_options(
+            &js_sys::Array::of1(&contents.into()),
+            &options,
+        )
+        .map_err(js_error)
+    };
+    let items = js_sys::Object::new();
+    for (mime, contents) in [("text/plain", &text), ("text/html", &html)] {
+        js_sys::Reflect::set(&items, &mime.into(), &blob(contents, mime)?.into())
+            .map_err(js_error)?;
+    }
+    let item = web_sys::ClipboardItem::new_with_record_from_str_to_blob_promise(&items)
+        .map_err(js_error)?;
+    let promise = window
+        .navigator()
+        .clipboard()
+        .write(&js_sys::Array::of1(&item));
+    JsFuture::from(promise).await.map_err(js_error)?;
+    Ok(())
+}

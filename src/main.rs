@@ -1,5 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+#[cfg(not(target_family = "wasm"))]
+mod clipboard;
 mod cover;
 mod debug;
 mod export;
