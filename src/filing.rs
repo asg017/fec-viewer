@@ -104,9 +104,15 @@ pub enum Source {
     /// A file on disk, reopened for every pass.
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
     Path(PathBuf),
-    /// A whole file already in memory, shared by every pass.
+    /// A file already in memory, shared by every pass.
     #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
-    Bytes { name: String, bytes: Arc<[u8]> },
+    Bytes {
+        name: String,
+        bytes: Arc<[u8]>,
+        /// The whole file's size, when `bytes` is only its first part (the
+        /// browser demo can only fetch so much of a filing).
+        full_len: Option<u64>,
+    },
 }
 
 impl Source {
@@ -118,6 +124,14 @@ impl Source {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string()),
             Source::Bytes { name, .. } => name.clone(),
+        }
+    }
+
+    /// The whole file's size, if only the first part of it is here.
+    pub fn truncated_from(&self) -> Option<u64> {
+        match self {
+            Source::Path(_) => None,
+            Source::Bytes { full_len, .. } => *full_len,
         }
     }
 
@@ -161,7 +175,7 @@ impl OpenFiling {
     pub fn open(source: Source) -> anyhow::Result<Arc<Self>> {
         let (summary, file_len) = match &source {
             Source::Path(path) => Filing::<File>::from_path(path).map(summarize),
-            Source::Bytes { name, bytes } => {
+            Source::Bytes { name, bytes, .. } => {
                 let id = Path::new(name)
                     .file_stem()
                     .map_or_else(|| name.clone(), |s| s.to_string_lossy().into_owned());
@@ -915,6 +929,7 @@ mod tests {
         let bytes = Source::Bytes {
             name: "1234.fec".into(),
             bytes: std::fs::read(file.path()).unwrap().into(),
+            full_len: None,
         };
         let (a, b) = (count(file.path()), count_source(&bytes));
         assert_eq!(a.types, b.types);

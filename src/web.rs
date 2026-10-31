@@ -25,9 +25,17 @@ use crate::{Assets, filing::Source, view::FilingView};
 pub const SAMPLE_FILE: &str = "1944135.fec";
 
 /// CORS proxy for docquery.fec.gov's raw filings (github.com/asg017/fec-proxy).
-/// It only answers allowed origins (and localhost), and only filings up to
-/// 10 MB in one GET.
+/// It only answers allowed origins (and localhost).
 const PROXY: &str = "https://fec-cors-proxy.garcia.workers.dev/filings/";
+
+/// The most the proxy sends in one response. Bigger filings are fetched as
+/// a range of their first this-many bytes, and shown as partial.
+const PROXY_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Where docquery posts filing `id`, to download the whole thing directly.
+pub fn docquery_url(id: &str) -> String {
+    format!("https://docquery.fec.gov/dcdev/posted/{id}.fec")
+}
 
 type Delivery = Result<Source, String>;
 
@@ -139,6 +147,7 @@ fn read_file(file: web_sys::File) {
             Ok(buffer) => Ok(Source::Bytes {
                 name,
                 bytes: js_sys::Uint8Array::new(&buffer).to_vec().into(),
+                full_len: None,
             }),
             Err(e) => Err(format!("Failed to read {name}: {}", js_error(e))),
         };
@@ -150,7 +159,7 @@ fn read_file(file: web_sys::File) {
 pub fn fetch_file(url: String) {
     set_url_param("file", &url);
     let name = url.rsplit('/').next().unwrap_or(&url).to_owned();
-    fetch(url, name);
+    fetch(url, name, None);
 }
 
 /// `1944135`, `FEC-1944135` or `1944135.fec` → `1944135`.
@@ -168,7 +177,11 @@ fn parse_filing_id(input: &str) -> Option<String> {
 /// (`?id=…`) so the page can be reloaded or shared.
 fn open_filing_id(id: String) {
     set_url_param("id", &id);
-    fetch(format!("{PROXY}{id}.fec"), format!("{id}.fec"));
+    fetch(
+        format!("{PROXY}{id}.fec"),
+        format!("{id}.fec"),
+        Some(PROXY_MAX_BYTES),
+    );
 }
 
 /// Ask for a filing ID with the browser's prompt and open it.
@@ -212,14 +225,25 @@ fn set_url_query(query: &str) {
 }
 
 /// Fetch `url` and hand its bytes to the view as a filing called `name`.
-fn fetch(url: String, name: String) {
+/// With `max_bytes`, ask for at most that many: a bigger file arrives as its
+/// first part, cut back to the last whole line, and is marked partial.
+fn fetch(url: String, name: String, max_bytes: Option<u64>) {
     spawn_local(async move {
         let result = async {
             let window = web_sys::window().ok_or("no window")?;
-            let response: web_sys::Response = JsFuture::from(window.fetch_with_str(&url))
-                .await
-                .map_err(js_error)?
-                .unchecked_into();
+            let init = web_sys::RequestInit::new();
+            if let Some(max) = max_bytes {
+                let headers = web_sys::Headers::new().map_err(js_error)?;
+                headers
+                    .set("Range", &format!("bytes=0-{}", max - 1))
+                    .map_err(js_error)?;
+                init.set_headers(&headers);
+            }
+            let response: web_sys::Response =
+                JsFuture::from(window.fetch_with_str_and_init(&url, &init))
+                    .await
+                    .map_err(js_error)?
+                    .unchecked_into();
             if !response.ok() {
                 // The proxy explains itself in a short text body.
                 let detail = match response.text() {
@@ -233,16 +257,29 @@ fn fetch(url: String, name: String) {
                     },
                 );
             }
+            // A 206's Content-Range ends in the whole file's size.
+            let full_len = (response.status() == 206)
+                .then(|| response.headers().get("Content-Range").ok().flatten())
+                .flatten()
+                .and_then(|range| range.rsplit('/').next()?.parse::<u64>().ok());
             let buffer = JsFuture::from(response.array_buffer().map_err(js_error)?)
                 .await
                 .map_err(js_error)?;
-            Ok(js_sys::Uint8Array::new(&buffer).to_vec())
+            let mut bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+            let full_len = full_len.filter(|&full| full > bytes.len() as u64);
+            if full_len.is_some() {
+                // Don't hand the parser half a record.
+                let end = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+                bytes.truncate(end);
+            }
+            Ok((bytes, full_len))
         }
         .await;
         deliver(match result {
-            Ok(bytes) => Ok(Source::Bytes {
+            Ok((bytes, full_len)) => Ok(Source::Bytes {
                 name,
                 bytes: bytes.into(),
+                full_len,
             }),
             Err(e) => Err(format!("Failed to fetch {url}: {e}")),
         });

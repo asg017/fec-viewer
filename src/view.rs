@@ -567,8 +567,9 @@ impl Render for FilingView {
             .drag_over::<ExternalPaths>(|style, _, _, cx| style.bg(cx.theme().drop_target));
 
         match (&self.filing, &self.error) {
-            (Some(_), _) => root
+            (Some(filing), _) => root
                 .child(self.render_header(cx))
+                .children(render_partial_warning(filing, cx))
                 .child(
                     h_flex()
                         .flex_1()
@@ -1135,6 +1136,41 @@ fn render_kv(id: impl Into<ElementId>, kv: Vec<(String, String)>, cx: &App) -> i
                 )
                 .child(div().flex_1().min_w_0().child(v))
         }))
+}
+
+/// A banner for a filing only partly fetched, so nothing it shows passes for
+/// the whole thing.
+fn render_partial_warning(filing: &OpenFiling, cx: &App) -> Option<impl IntoElement> {
+    let full_len = filing.source.truncated_from()?;
+    let theme = cx.theme();
+    let message = format!(
+        "Partial filing: only the first {} of {} was fetched, the most the browser demo can. \
+         Record counts, tables and exports cover only that part.",
+        format_bytes(filing.file_len),
+        format_bytes(full_len),
+    );
+    let bar = h_flex()
+        .px_3()
+        .py_2()
+        .gap_3()
+        .bg(theme.warning)
+        .text_color(theme.warning_foreground)
+        .font_weight(FontWeight::MEDIUM)
+        .child(div().flex_1().min_w_0().child(message));
+    #[cfg(target_family = "wasm")]
+    let bar = {
+        let url = crate::web::docquery_url(&filing.summary.filing_id);
+        bar.child(
+            Button::new("download-full")
+                .small()
+                .label("Download full filing")
+                .tooltip(
+                    "From docquery.fec.gov. Drop it on this page, or open it in the desktop app.",
+                )
+                .on_click(move |_, _, cx| cx.open_url(&url)),
+        )
+    };
+    Some(bar)
 }
 
 fn render_empty(error: Option<String>, cx: &App) -> impl IntoElement {
