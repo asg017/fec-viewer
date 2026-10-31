@@ -1139,7 +1139,8 @@ fn empty_hint(cx: &App) -> impl IntoElement {
         .child("or choose File → Open… (⌘O / Ctrl+O)")
 }
 
-/// The browser has no File menu: offer a file picker and the bundled sample.
+/// The browser has no File menu: offer a file picker, lookup by filing ID,
+/// and the bundled sample.
 #[cfg(target_family = "wasm")]
 fn empty_hint(_: &App) -> impl IntoElement {
     use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -1150,6 +1151,11 @@ fn empty_hint(_: &App) -> impl IntoElement {
             Button::new("choose-file")
                 .label("Choose a file…")
                 .on_click(|_, _, _| crate::web::choose_file()),
+        )
+        .child(
+            Button::new("open-by-id")
+                .label("Open filing by ID…")
+                .on_click(|_, _, _| crate::web::prompt_filing_id()),
         )
         .child(
             Button::new("load-sample")
