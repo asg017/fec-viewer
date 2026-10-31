@@ -751,6 +751,22 @@ impl CollectState {
     pub fn position(&self, ix: usize) -> Option<u64> {
         self.chunks.get(ix / CHUNK_ROWS)?.position(ix % CHUNK_ROWS)
     }
+
+    /// A finished collection of these rows, in one chunk.
+    #[cfg(test)]
+    pub fn from_rows(rows: &[&[&str]]) -> Self {
+        let mut chunk = Chunk::default();
+        for row in rows {
+            chunk.push(&csv::ByteRecord::from(row.to_vec()), 0);
+        }
+        Self {
+            rows: chunk.len(),
+            max_fields: rows.iter().map(|r| r.len()).max().unwrap_or(0),
+            chunks: vec![Arc::new(chunk)],
+            done: true,
+            ..Default::default()
+        }
+    }
 }
 
 /// Records being (or done being) collected. Dropping it stops the scan.

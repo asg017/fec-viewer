@@ -2,6 +2,7 @@
 
 mod cover;
 mod debug;
+mod export;
 mod filing;
 #[cfg_attr(target_family = "wasm", allow(dead_code))]
 mod tabs;
@@ -18,6 +19,20 @@ use gpui_kit::*;
 use crate::{filing::Source, view::FilingView};
 
 actions!(fec_viewer, [Open, CloseWindow, Minimize, Zoom, Quit]);
+
+// Only the icons the viewer draws, embedded so they need no network (the
+// browser demo would otherwise fetch them from a CDN).
+gpui_kit::assets::icon_assets!(
+    Assets,
+    [
+        ChevronDown,
+        ChevronRight,
+        ChevronsUpDown,
+        Copy,
+        Download,
+        Inbox
+    ]
+);
 
 /// Windows we've opened, so "Open…" can reuse an empty one.
 #[derive(Default)]
@@ -115,7 +130,7 @@ fn main() {
 #[cfg(not(target_family = "wasm"))]
 fn main() {
     let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
-    let app = gpui_kit::application();
+    let app = gpui_kit::application().with_assets(Assets);
     app.on_open_urls(move |urls| {
         let _ = url_tx.unbounded_send(urls);
     });

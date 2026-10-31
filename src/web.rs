@@ -17,7 +17,7 @@ use gpui_kit::{
 use wasm_bindgen::{JsCast as _, prelude::*};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
-use crate::{filing::Source, view::FilingView};
+use crate::{Assets, filing::Source, view::FilingView};
 
 /// The bundled filing the empty state offers, served next to `index.html`.
 pub const SAMPLE_FILE: &str = "1944135.fec";
@@ -34,12 +34,6 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
-// Only the icons the viewer draws, embedded so the demo works offline.
-gpui_kit::assets::icon_assets!(
-    WebAssets,
-    [ChevronDown, ChevronRight, ChevronsUpDown, Inbox]
-);
-
 pub fn main() {
     gpui_kit::platform::web_init();
 
@@ -48,7 +42,7 @@ pub fn main() {
         WebBackendPreference::Auto,
         CanvasFontFallback::EmojiAndCjk,
     ));
-    let app = Application::with_platform(platform).with_assets(WebAssets);
+    let app = Application::with_platform(platform).with_assets(Assets);
 
     let (tx, rx) = mpsc::unbounded();
     DELIVERIES.with(|d| *d.borrow_mut() = Some(tx));
@@ -223,4 +217,32 @@ fn url_param(name: &str) -> Option<String> {
         .ok()?
         .get(name)
         .filter(|v| !v.is_empty())
+}
+
+/// Save `contents` as a download named `name`.
+pub fn download(name: &str, contents: &str, mime: &str) -> Result<(), String> {
+    let window = web_sys::window().ok_or("no window")?;
+    let document = window.document().ok_or("no document")?;
+    let options = web_sys::BlobPropertyBag::new();
+    options.set_type(mime);
+    let blob = web_sys::Blob::new_with_str_sequence_and_options(
+        &js_sys::Array::of1(&contents.into()),
+        &options,
+    )
+    .map_err(js_error)?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(js_error)?;
+    let link: web_sys::HtmlAnchorElement = document
+        .create_element("a")
+        .map_err(js_error)?
+        .unchecked_into();
+    link.set_href(&url);
+    link.set_download(name);
+    link.click();
+    // Revoked once the browser has had a chance to start the download.
+    let revoke = Closure::once_into_js(move || {
+        let _ = web_sys::Url::revoke_object_url(&url);
+    });
+    let _ = window
+        .set_timeout_with_callback_and_timeout_and_arguments_0(revoke.unchecked_ref(), 10_000);
+    Ok(())
 }

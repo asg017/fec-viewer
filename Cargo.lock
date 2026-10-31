@@ -1784,7 +1784,7 @@ dependencies = [
 [[package]]
 name = "fec-parser"
 version = "0.1.0"
-source = "git+https://github.com/asg017/libfec?branch=main#7dc5fd6b6eb070ef4961094ffebbdaa2d125e830"
+source = "git+https://github.com/asg017/libfec?tag=v0.0.35-alpha.5#5aeea098db79ef70d813d94975bb7174bdacf160"
 dependencies = [
  "anyhow",
  "bstr",
@@ -1803,7 +1803,7 @@ dependencies = [
 [[package]]
 name = "fec-parser-macros"
 version = "0.1.0"
-source = "git+https://github.com/asg017/libfec?branch=main#7dc5fd6b6eb070ef4961094ffebbdaa2d125e830"
+source = "git+https://github.com/asg017/libfec?tag=v0.0.35-alpha.5#5aeea098db79ef70d813d94975bb7174bdacf160"
 dependencies = [
  "proc-macro2",
  "quote",
